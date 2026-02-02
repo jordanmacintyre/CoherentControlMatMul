@@ -205,3 +205,19 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Simulation artifacts
+sim/obj_dir/
+sim/results/*.vcd
+sim/results/*.json
+*.vcd
+*.fst
+
+# Verilator build artifacts
+obj_dir/
+*.verilator
+Vtop*
+
+# cocotb artifacts
+results.xml
+sim_build/
