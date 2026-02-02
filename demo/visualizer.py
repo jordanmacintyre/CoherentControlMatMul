@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 if TYPE_CHECKING:
     from .control_loop import CoherentController, ControlState
+    from .svd_control_loop import SVDCoherentController, SVDControlState
 
 
 class ControlVisualizer:
@@ -455,6 +456,237 @@ class ControlVisualizer:
             ax.axvline(x=0, color="gray", linewidth=0.5)
 
         # Add overall title with results
+        status = "LOCKED" if state.locked else "NOT LOCKED"
+        plt.suptitle(
+            f"{title}\n{status} after {state.iteration} iterations | "
+            f"Final error: {state.error:.2e}",
+            fontsize=14,
+        )
+
+        plt.tight_layout()
+        return fig
+
+    def plot_svd_summary(
+        self,
+        controller: "SVDCoherentController",
+        title: str = "SVD Calibration Summary",
+    ) -> plt.Figure:
+        """
+        Create a comprehensive summary plot for SVD calibration.
+
+        Args:
+            controller: SVD controller with completed calibration
+            title: Plot title
+
+        Returns:
+            matplotlib Figure
+        """
+        fig = plt.figure(figsize=(16, 14))
+
+        # Layout: 3x3 grid
+        # [convergence | V phases   | U phases  ]
+        # [sigma_bar   | matrix     | error     ]
+        # [iq_00       | iq_11      | svd_info  ]
+
+        state = controller.state
+        target = controller.target_matrix
+        U_target, sigma_target, Vh_target = controller.target_svd
+
+        # 1. Convergence plot
+        ax1 = fig.add_subplot(3, 3, 1)
+        if state.error_history:
+            iterations = np.arange(len(state.error_history))
+            ax1.semilogy(iterations, state.error_history, "b-", linewidth=2)
+            ax1.axhline(
+                y=controller.config.error_threshold,
+                color="r",
+                linestyle="--",
+                label="Threshold",
+            )
+        ax1.set_xlabel("Iteration")
+        ax1.set_ylabel("Error (log)")
+        ax1.set_title("Convergence")
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+
+        # 2. V† phase trajectories
+        ax2 = fig.add_subplot(3, 3, 2)
+        if state.phase_history_v:
+            phase_history_v = np.array(state.phase_history_v)
+            iters_v = np.arange(len(phase_history_v))
+            for i in range(4):
+                ax2.plot(iters_v, phase_history_v[:, i], linewidth=2, label=f"φ_v{i}")
+        ax2.set_xlabel("Iteration")
+        ax2.set_ylabel("Phase (rad)")
+        ax2.set_title("V† Mesh Phases")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(fontsize=8)
+
+        # 3. U phase trajectories
+        ax3 = fig.add_subplot(3, 3, 3)
+        if state.phase_history_u:
+            phase_history_u = np.array(state.phase_history_u)
+            iters_u = np.arange(len(phase_history_u))
+            for i in range(4):
+                ax3.plot(iters_u, phase_history_u[:, i], linewidth=2, label=f"φ_u{i}")
+        ax3.set_xlabel("Iteration")
+        ax3.set_ylabel("Phase (rad)")
+        ax3.set_title("U Mesh Phases")
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(fontsize=8)
+
+        # 4. Singular values bar chart
+        ax4 = fig.add_subplot(3, 3, 4)
+        x_pos = np.array([0, 1])
+        width = 0.35
+        # Target singular values
+        ax4.bar(x_pos - width/2, sigma_target, width, label="Target σ", color="blue", alpha=0.7)
+        # Achieved singular values (from VOA DAC codes)
+        sigma_achieved = controller.plant.voas.dac_to_sigma(state.sigma_dac)
+        ax4.bar(x_pos + width/2, sigma_achieved, width, label="Achieved σ", color="green", alpha=0.7)
+        ax4.set_xticks(x_pos)
+        ax4.set_xticklabels(["σ₀", "σ₁"])
+        ax4.set_ylabel("Singular Value")
+        ax4.set_title("Singular Values (Σ)")
+        ax4.legend()
+        ax4.grid(True, alpha=0.3, axis="y")
+
+        # 5. Final matrix heatmap
+        ax5 = fig.add_subplot(3, 3, 5)
+        measured = controller.measure_matrix()
+        measured_real = np.real(measured)
+        im = ax5.imshow(measured_real, cmap="RdBu", vmin=-1, vmax=1)
+        ax5.set_title("Final Matrix (Real)")
+        ax5.set_xticks([0, 1])
+        ax5.set_yticks([0, 1])
+        for i in range(2):
+            for j in range(2):
+                ax5.text(
+                    j,
+                    i,
+                    f"{measured_real[i, j]:.2f}\n(t:{target[i, j]:.2f})",
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                )
+        plt.colorbar(im, ax=ax5)
+
+        # 6. Error matrix
+        ax6 = fig.add_subplot(3, 3, 6)
+        error_matrix = measured_real - target
+        max_err = max(0.1, np.max(np.abs(error_matrix)))
+        im6 = ax6.imshow(error_matrix, cmap="RdBu", vmin=-max_err, vmax=max_err)
+        ax6.set_title("Error (Measured - Target)")
+        ax6.set_xticks([0, 1])
+        ax6.set_yticks([0, 1])
+        for i in range(2):
+            for j in range(2):
+                ax6.text(
+                    j, i, f"{error_matrix[i, j]:.3f}",
+                    ha="center", va="center", fontsize=10
+                )
+        plt.colorbar(im6, ax=ax6)
+
+        # 7. All 4 matrix elements I/Q trajectory on one plot
+        ax7 = fig.add_subplot(3, 3, 7)
+        if state.matrix_history:
+            matrix_history = np.array(state.matrix_history)
+            element_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]  # Blue, orange, green, red
+            element_labels = ["M00", "M01", "M10", "M11"]
+
+            for idx, (i, j) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+                values = matrix_history[:, i, j]
+                color = element_colors[idx]
+
+                # Plot trajectory as scatter with fading alpha (newer = darker)
+                n_points = len(values)
+                alphas = np.linspace(0.2, 1.0, n_points)
+                sizes = np.linspace(10, 40, n_points)
+
+                for k in range(n_points):
+                    ax7.scatter(
+                        np.real(values[k]), np.imag(values[k]),
+                        color=color, alpha=alphas[k], s=sizes[k],
+                        marker="o" if k < n_points - 1 else "s"
+                    )
+
+                # Final position with label
+                ax7.scatter(
+                    np.real(values[-1]), np.imag(values[-1]),
+                    color=color, s=80, marker="s", edgecolors="black",
+                    linewidth=1.5, label=f"{element_labels[idx]}: {np.real(values[-1]):.2f}",
+                    zorder=10
+                )
+
+                # Target position
+                ax7.scatter(
+                    target[i, j], 0, color=color, s=100, marker="*",
+                    edgecolors="black", linewidth=0.5, zorder=11
+                )
+
+            ax7.set_xlabel("Real (I)")
+            ax7.set_ylabel("Imag (Q)")
+            ax7.set_title("Matrix Elements I/Q (stars = targets)")
+            ax7.set_xlim(-1.5, 1.5)
+            ax7.set_ylim(-0.5, 0.5)
+            ax7.set_aspect("equal")
+            ax7.grid(True, alpha=0.3)
+            ax7.axhline(y=0, color="gray", linewidth=0.5)
+            ax7.axvline(x=0, color="gray", linewidth=0.5)
+            ax7.legend(fontsize=7, loc="upper right")
+        else:
+            ax7.text(0.5, 0.5, "No trajectory data", ha="center", va="center", transform=ax7.transAxes)
+            ax7.set_title("Matrix Elements I/Q")
+
+        # 8. Matrix element values over time (real part) with target lines
+        ax8 = fig.add_subplot(3, 3, 8)
+        if state.matrix_history:
+            matrix_history = np.array(state.matrix_history)
+            element_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+            element_labels = ["M00", "M01", "M10", "M11"]
+
+            for idx, (i, j) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+                values = matrix_history[:, i, j]
+                # Plot real part of measured values
+                ax8.plot(np.real(values), color=element_colors[idx], linewidth=1.5,
+                         label=f"{element_labels[idx]}: {target[i,j]:.2f}")
+                # Target as horizontal dashed line
+                ax8.axhline(y=target[i, j], color=element_colors[idx], linestyle="--",
+                           linewidth=1, alpha=0.7)
+
+            ax8.set_xlabel("Iteration")
+            ax8.set_ylabel("Matrix Element Value")
+            ax8.set_title("Element Values vs Targets (dashed)")
+            ax8.grid(True, alpha=0.3)
+            ax8.legend(fontsize=7, loc="best")
+        else:
+            ax8.text(0.5, 0.5, "No trajectory data", ha="center", va="center", transform=ax8.transAxes)
+            ax8.set_title("Element Values Over Time")
+
+        # 9. SVD info text
+        ax9 = fig.add_subplot(3, 3, 9)
+        ax9.axis("off")
+
+        info_text = (
+            f"SVD Architecture: M = U · Σ · V†\n\n"
+            f"Target Singular Values:\n"
+            f"  σ₀ = {sigma_target[0]:.4f}\n"
+            f"  σ₁ = {sigma_target[1]:.4f}\n\n"
+            f"Achieved Singular Values:\n"
+            f"  σ₀ = {sigma_achieved[0]:.4f}\n"
+            f"  σ₁ = {sigma_achieved[1]:.4f}\n\n"
+            f"Calibration Status:\n"
+            f"  V† locked: {state.v_locked}\n"
+            f"  U locked: {state.u_locked}\n"
+            f"  Overall: {'LOCKED' if state.locked else 'NOT LOCKED'}\n\n"
+            f"Total iterations: {state.iteration}\n"
+            f"Final error: {state.error:.2e}"
+        )
+        ax9.text(0.1, 0.9, info_text, transform=ax9.transAxes,
+                 fontsize=10, verticalalignment="top", fontfamily="monospace",
+                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+        # Add overall title
         status = "LOCKED" if state.locked else "NOT LOCKED"
         plt.suptitle(
             f"{title}\n{status} after {state.iteration} iterations | "

@@ -71,6 +71,20 @@ class MZIMesh:
         """
         Compute the 2x2 complex transfer matrix for given phases.
 
+        Uses the standard Reck/Clements MZI decomposition form that can
+        realize ANY 2x2 unitary matrix:
+
+            M = D2 · R(θ) · D1
+
+        where:
+            D1 = diag(e^{jφ0}, 1) - input phase on port 0
+            D2 = diag(e^{jφ1}, e^{jφ_out}) - output phases
+            R(θ) = [[cos(θ/2), -sin(θ/2)], [sin(θ/2), cos(θ/2)]] - rotation
+
+        This gives:
+            M = [[e^{j(φ0+φ1)}cos(θ/2), -e^{jφ1}sin(θ/2)],
+                 [e^{j(φ0+φ_out)}sin(θ/2), e^{jφ_out}cos(θ/2)]]
+
         Args:
             phases: Optional phase array. If None, uses internal state.
 
@@ -80,26 +94,25 @@ class MZIMesh:
         if phases is None:
             phases = self._phases
 
-        theta = phases[0]  # MZI splitting angle
-        phi_in0 = phases[1]  # Input 0 phase
-        phi_in1 = phases[2]  # Input 1 phase
-        phi_out = phases[3]  # Output global phase
+        theta = phases[0]    # Rotation/splitting angle
+        phi_in0 = phases[1]  # Input phase on port 0
+        phi_in1 = phases[2]  # Output phase on port 0
+        phi_out = phases[3]  # Output phase on port 1 (global-ish)
 
         cos_half = np.cos(theta / 2)
         sin_half = np.sin(theta / 2)
 
-        # Build transfer matrix
-        # Standard MZI with external phase shifters
+        # Build transfer matrix using Reck/Clements structure
+        # This can realize ANY 2x2 unitary
         M = np.array(
             [
-                [np.exp(1j * phi_in0) * cos_half, 1j * sin_half],
-                [1j * sin_half, np.exp(1j * phi_in1) * cos_half],
+                [np.exp(1j * (phi_in0 + phi_in1)) * cos_half,
+                 -np.exp(1j * phi_in1) * sin_half],
+                [np.exp(1j * (phi_in0 + phi_out)) * sin_half,
+                 np.exp(1j * phi_out) * cos_half],
             ],
             dtype=np.complex128,
         )
-
-        # Apply output phase
-        M *= np.exp(1j * phi_out)
 
         return M
 
@@ -124,41 +137,61 @@ class MZIMesh:
         """
         Decompose a 2x2 unitary matrix into MZI phases.
 
-        This finds phases [theta, phi_in0, phi_in1, phi_out] such that
-        compute_transfer_matrix(phases) approximates U.
+        For the Reck/Clements structure:
+            M = [[e^{j(φ0+φ1)}cos(θ/2), -e^{jφ1}sin(θ/2)],
+                 [e^{j(φ0+φ_out)}sin(θ/2), e^{jφ_out}cos(θ/2)]]
+
+        Any 2x2 unitary can be exactly decomposed into this form.
 
         Args:
             U: 2x2 unitary matrix to decompose
 
         Returns:
-            Array of 4 phase values in radians
+            Array of 4 phase values [theta, phi_in0, phi_in1, phi_out] in radians
         """
-        # Extract global phase
-        det = np.linalg.det(U)
-        global_phase = np.angle(det) / 2
-        U_normalized = U * np.exp(-1j * global_phase)
+        # From the matrix structure:
+        # |U[0,1]| = sin(θ/2) and |U[1,0]| = sin(θ/2)
+        # |U[0,0]| = cos(θ/2) and |U[1,1]| = cos(θ/2)
 
-        # For a unitary with our structure:
-        # [e^{j*phi0}*cos(t/2), j*sin(t/2)]
-        # [j*sin(t/2),          e^{j*phi1}*cos(t/2)]
-        #
-        # |U[0,1]| = |U[1,0]| = sin(t/2)
-        # So theta = 2 * arcsin(|U[0,1]|)
+        # Get theta from magnitudes (average for numerical stability)
+        sin_half = (np.abs(U[0, 1]) + np.abs(U[1, 0])) / 2
+        cos_half = (np.abs(U[0, 0]) + np.abs(U[1, 1])) / 2
 
-        sin_half = np.abs(U_normalized[0, 1])
-        sin_half = np.clip(sin_half, 0, 1)  # Numerical safety
+        # Normalize in case of numerical errors
+        norm = np.sqrt(sin_half**2 + cos_half**2)
+        if norm > 1e-10:
+            sin_half /= norm
+            cos_half /= norm
+
+        sin_half = np.clip(sin_half, 0, 1)
         theta = 2 * np.arcsin(sin_half)
 
-        cos_half = np.cos(theta / 2)
-        if cos_half > 1e-10:
-            phi_in0 = np.angle(U_normalized[0, 0] / cos_half)
-            phi_in1 = np.angle(U_normalized[1, 1] / cos_half)
-        else:
-            # Edge case: full crossover (theta = pi)
-            phi_in0 = 0
-            phi_in1 = 0
+        # Now solve for phases from the matrix elements
+        if cos_half > 1e-10 and sin_half > 1e-10:
+            # M[1,1] = e^{jφ_out}cos(θ/2)  =>  φ_out = angle(U[1,1])
+            phi_out = np.angle(U[1, 1])
 
-        return np.array([theta, phi_in0, phi_in1, global_phase], dtype=np.float64)
+            # M[0,1] = -e^{jφ1}sin(θ/2)  =>  φ1 = angle(-U[0,1]) = angle(U[0,1]) + π
+            phi_in1 = np.angle(-U[0, 1])
+
+            # M[0,0] = e^{j(φ0+φ1)}cos(θ/2)  =>  φ0 = angle(U[0,0]) - φ1
+            phi_in0 = np.angle(U[0, 0]) - phi_in1
+
+        elif cos_half > 1e-10:
+            # sin_half ≈ 0: nearly identity
+            # M ≈ [[e^{j(φ0+φ1)}, 0], [0, e^{jφ_out}]]
+            phi_out = np.angle(U[1, 1])
+            phi_in0 = 0
+            phi_in1 = np.angle(U[0, 0])
+
+        else:
+            # cos_half ≈ 0: nearly full swap (θ ≈ π)
+            # M ≈ [[0, -e^{jφ1}], [e^{j(φ0+φ_out)}, 0]]
+            phi_in1 = np.angle(-U[0, 1])
+            phi_out = 0
+            phi_in0 = np.angle(U[1, 0]) - phi_out
+
+        return np.array([theta, phi_in0, phi_in1, phi_out], dtype=np.float64)
 
     @staticmethod
     def closest_unitary(M: NDArray[np.complex128]) -> NDArray[np.complex128]:

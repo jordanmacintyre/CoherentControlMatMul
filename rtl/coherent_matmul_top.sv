@@ -9,7 +9,8 @@ module coherent_matmul_top
     parameter int DATA_WIDTH_P  = DATA_WIDTH,
     parameter int PHASE_WIDTH_P = PHASE_WIDTH,
     parameter int NUM_PHASES_P  = NUM_PHASES,
-    parameter int ADC_WIDTH_P   = ADC_WIDTH
+    parameter int ADC_WIDTH_P   = ADC_WIDTH,
+    parameter int VOA_WIDTH_P   = VOA_WIDTH
 )(
     input  logic                           clk,
     input  logic                           rst_n,
@@ -27,6 +28,11 @@ module coherent_matmul_top
     // Control signals
     input  logic                           start_cal,   // Start calibration
     input  logic                           start_eval,  // Start evaluation
+    input  logic                           svd_mode,    // SVD mode (1) or unitary mode (0)
+
+    // SVD mode inputs (pre-computed singular values as DAC codes)
+    input  logic [VOA_WIDTH_P-1:0]         sigma_dac0,  // σ₀ VOA code
+    input  logic [VOA_WIDTH_P-1:0]         sigma_dac1,  // σ₁ VOA code
 
     // Status outputs
     output logic                           cal_done,
@@ -39,12 +45,17 @@ module coherent_matmul_top
     output logic signed [DATA_WIDTH_P-1:0] y1_out,
     output logic                           y_valid,
 
-    // Plant interface - outputs to plant
+    // Plant interface - outputs to plant (unitary mode / legacy)
     output logic [PHASE_WIDTH_P-1:0]       phi_dac [NUM_PHASES_P],
     output logic signed [DATA_WIDTH_P-1:0] x_drive0,
     output logic signed [DATA_WIDTH_P-1:0] x_drive1,
     output logic                           plant_enable,
     output logic [1:0]                     plant_mode,
+
+    // SVD plant interface - extended outputs
+    output logic [PHASE_WIDTH_P-1:0]       phi_dac_v [NUM_PHASES_V],  // V† mesh phases
+    output logic [VOA_WIDTH_P-1:0]         voa_dac [NUM_VOAS],        // Σ attenuators
+    output logic [PHASE_WIDTH_P-1:0]       phi_dac_u [NUM_PHASES_U],  // U mesh phases
 
     // Plant interface - inputs from plant
     input  logic signed [ADC_WIDTH_P-1:0]  adc_i0,
@@ -61,13 +72,22 @@ module coherent_matmul_top
     // State machines
     top_state_t top_state, top_state_next;
     cal_state_t cal_state, cal_state_next;
+    svd_cal_state_t svd_cal_state, svd_cal_state_next;
 
     // Status flags structure
     status_flags_t status;
 
-    // Phase registers
+    // Phase registers (unitary mode)
     logic [PHASE_WIDTH_P-1:0] phi_reg [NUM_PHASES_P];
     logic [PHASE_WIDTH_P-1:0] phi_step;  // Current step size
+
+    // SVD mode registers
+    logic [PHASE_WIDTH_P-1:0] phi_reg_v [NUM_PHASES_V];  // V† mesh phases
+    logic [PHASE_WIDTH_P-1:0] phi_reg_u [NUM_PHASES_U];  // U mesh phases
+    logic [VOA_WIDTH_P-1:0]   voa_reg [NUM_VOAS];        // VOA codes
+    svd_component_t           svd_component;             // Current component being calibrated
+    logic                     v_locked_reg;
+    logic                     u_locked_reg;
 
     // Measured matrix elements (from I/Q measurements)
     // m_hat[0] = M00, m_hat[1] = M01, m_hat[2] = M10, m_hat[3] = M11
@@ -85,7 +105,7 @@ module coherent_matmul_top
     logic [3:0]  sample_counter;
     logic [15:0] iteration_counter;
     logic [3:0]  lock_counter;
-    logic [1:0]  phase_index;  // Which phase we're optimizing
+    logic [1:0]  phase_index;  // Which phase we're optimizing (0-3 for each mesh)
 
     // Sample accumulators
     logic signed [DATA_WIDTH_P+3:0] i0_accum, q0_accum;
@@ -95,6 +115,9 @@ module coherent_matmul_top
     logic weights_valid;
     logic cal_start_pending;
     logic eval_start_pending;
+
+    // Mode latch (captured at calibration start)
+    logic svd_mode_latched;
 
     //-------------------------------------------------------------------------
     // Input weight validation
@@ -109,6 +132,9 @@ module coherent_matmul_top
     assign cal_done     = (top_state == TOP_LOCKED) || (top_state == TOP_ERROR);
     assign cal_locked   = status.cal_locked;
     assign eval_done    = status.eval_done;
+
+    // SVD calibration done detection
+    wire svd_cal_done   = (svd_cal_state == SVD_CAL_LOCKED) || (svd_cal_state == SVD_CAL_ERROR);
 
     //-------------------------------------------------------------------------
     // Top-level state machine
@@ -131,10 +157,19 @@ module coherent_matmul_top
             end
 
             TOP_CAL: begin
-                if (cal_state == CAL_LOCKED)
-                    top_state_next = TOP_LOCKED;
-                else if (cal_state == CAL_ERROR)
-                    top_state_next = TOP_ERROR;
+                if (svd_mode_latched) begin
+                    // SVD mode: check SVD FSM
+                    if (svd_cal_state == SVD_CAL_LOCKED)
+                        top_state_next = TOP_LOCKED;
+                    else if (svd_cal_state == SVD_CAL_ERROR)
+                        top_state_next = TOP_ERROR;
+                end else begin
+                    // Unitary mode: check original FSM
+                    if (cal_state == CAL_LOCKED)
+                        top_state_next = TOP_LOCKED;
+                    else if (cal_state == CAL_ERROR)
+                        top_state_next = TOP_ERROR;
+                end
             end
 
             TOP_LOCKED: begin
@@ -261,6 +296,154 @@ module coherent_matmul_top
     end
 
     //-------------------------------------------------------------------------
+    // SVD Calibration FSM
+    //-------------------------------------------------------------------------
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            svd_cal_state <= SVD_CAL_IDLE;
+            svd_mode_latched <= 1'b0;
+        end else begin
+            svd_cal_state <= svd_cal_state_next;
+            // Latch SVD mode at calibration start
+            if (top_state == TOP_IDLE && start_cal)
+                svd_mode_latched <= svd_mode;
+        end
+    end
+
+    always_comb begin
+        svd_cal_state_next = svd_cal_state;
+
+        case (svd_cal_state)
+            SVD_CAL_IDLE: begin
+                if (top_state == TOP_CAL && svd_mode_latched)
+                    svd_cal_state_next = SVD_CAL_VALIDATE;
+            end
+
+            SVD_CAL_VALIDATE: begin
+                if (weights_valid)
+                    svd_cal_state_next = SVD_CAL_APPLY_BASIS0_V;
+                else
+                    svd_cal_state_next = SVD_CAL_ERROR;
+            end
+
+            // V† mesh calibration sequence
+            SVD_CAL_APPLY_BASIS0_V: svd_cal_state_next = SVD_CAL_SETTLE0_V;
+
+            SVD_CAL_SETTLE0_V: begin
+                if (settle_counter >= CAL_SETTLE_CYCLES)
+                    svd_cal_state_next = SVD_CAL_SAMPLE_COL0_V;
+            end
+
+            SVD_CAL_SAMPLE_COL0_V: begin
+                if (sample_counter >= CAL_AVG_SAMPLES)
+                    svd_cal_state_next = SVD_CAL_APPLY_BASIS1_V;
+            end
+
+            SVD_CAL_APPLY_BASIS1_V: svd_cal_state_next = SVD_CAL_SETTLE1_V;
+
+            SVD_CAL_SETTLE1_V: begin
+                if (settle_counter >= CAL_SETTLE_CYCLES)
+                    svd_cal_state_next = SVD_CAL_SAMPLE_COL1_V;
+            end
+
+            SVD_CAL_SAMPLE_COL1_V: begin
+                if (sample_counter >= CAL_AVG_SAMPLES)
+                    svd_cal_state_next = SVD_CAL_COMPUTE_ERR_V;
+            end
+
+            SVD_CAL_COMPUTE_ERR_V: svd_cal_state_next = SVD_CAL_PROBE_PLUS_V;
+
+            SVD_CAL_PROBE_PLUS_V: begin
+                if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES)
+                    svd_cal_state_next = SVD_CAL_PROBE_MINUS_V;
+            end
+
+            SVD_CAL_PROBE_MINUS_V: begin
+                if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES)
+                    svd_cal_state_next = SVD_CAL_UPDATE_V;
+            end
+
+            SVD_CAL_UPDATE_V: svd_cal_state_next = SVD_CAL_CHECK_V;
+
+            SVD_CAL_CHECK_V: begin
+                if (v_locked_reg)
+                    svd_cal_state_next = SVD_CAL_SET_SIGMA;
+                else if (iteration_counter >= CAL_MAX_ITERATIONS)
+                    svd_cal_state_next = SVD_CAL_ERROR;
+                else if (phase_index < NUM_PHASES_V - 1)
+                    svd_cal_state_next = SVD_CAL_PROBE_PLUS_V;
+                else
+                    svd_cal_state_next = SVD_CAL_APPLY_BASIS0_V;
+            end
+
+            // Sigma assignment (single cycle)
+            SVD_CAL_SET_SIGMA: svd_cal_state_next = SVD_CAL_APPLY_BASIS0_U;
+
+            // U mesh calibration sequence
+            SVD_CAL_APPLY_BASIS0_U: svd_cal_state_next = SVD_CAL_SETTLE0_U;
+
+            SVD_CAL_SETTLE0_U: begin
+                if (settle_counter >= CAL_SETTLE_CYCLES)
+                    svd_cal_state_next = SVD_CAL_SAMPLE_COL0_U;
+            end
+
+            SVD_CAL_SAMPLE_COL0_U: begin
+                if (sample_counter >= CAL_AVG_SAMPLES)
+                    svd_cal_state_next = SVD_CAL_APPLY_BASIS1_U;
+            end
+
+            SVD_CAL_APPLY_BASIS1_U: svd_cal_state_next = SVD_CAL_SETTLE1_U;
+
+            SVD_CAL_SETTLE1_U: begin
+                if (settle_counter >= CAL_SETTLE_CYCLES)
+                    svd_cal_state_next = SVD_CAL_SAMPLE_COL1_U;
+            end
+
+            SVD_CAL_SAMPLE_COL1_U: begin
+                if (sample_counter >= CAL_AVG_SAMPLES)
+                    svd_cal_state_next = SVD_CAL_COMPUTE_ERR_U;
+            end
+
+            SVD_CAL_COMPUTE_ERR_U: svd_cal_state_next = SVD_CAL_PROBE_PLUS_U;
+
+            SVD_CAL_PROBE_PLUS_U: begin
+                if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES)
+                    svd_cal_state_next = SVD_CAL_PROBE_MINUS_U;
+            end
+
+            SVD_CAL_PROBE_MINUS_U: begin
+                if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES)
+                    svd_cal_state_next = SVD_CAL_UPDATE_U;
+            end
+
+            SVD_CAL_UPDATE_U: svd_cal_state_next = SVD_CAL_CHECK_U;
+
+            SVD_CAL_CHECK_U: begin
+                if (u_locked_reg)
+                    svd_cal_state_next = SVD_CAL_LOCKED;
+                else if (iteration_counter >= CAL_MAX_ITERATIONS)
+                    svd_cal_state_next = SVD_CAL_ERROR;
+                else if (phase_index < NUM_PHASES_U - 1)
+                    svd_cal_state_next = SVD_CAL_PROBE_PLUS_U;
+                else
+                    svd_cal_state_next = SVD_CAL_APPLY_BASIS0_U;
+            end
+
+            SVD_CAL_LOCKED: begin
+                if (top_state != TOP_CAL && top_state != TOP_LOCKED)
+                    svd_cal_state_next = SVD_CAL_IDLE;
+            end
+
+            SVD_CAL_ERROR: begin
+                if (top_state == TOP_IDLE)
+                    svd_cal_state_next = SVD_CAL_IDLE;
+            end
+
+            default: svd_cal_state_next = SVD_CAL_IDLE;
+        endcase
+    end
+
+    //-------------------------------------------------------------------------
     // Calibration datapath
     //-------------------------------------------------------------------------
     always_ff @(posedge clk or negedge rst_n) begin
@@ -269,6 +452,20 @@ module coherent_matmul_top
             for (int i = 0; i < NUM_PHASES_P; i++) begin
                 phi_reg[i] <= 16'h8000;
             end
+            // Reset SVD registers
+            for (int i = 0; i < NUM_PHASES_V; i++) begin
+                phi_reg_v[i] <= 16'h8000;
+            end
+            for (int i = 0; i < NUM_PHASES_U; i++) begin
+                phi_reg_u[i] <= 16'h8000;
+            end
+            for (int i = 0; i < NUM_VOAS; i++) begin
+                voa_reg[i] <= VOA_FULL_TRANSMISSION;
+            end
+            svd_component <= SVD_COMP_V;
+            v_locked_reg <= 1'b0;
+            u_locked_reg <= 1'b0;
+
             phi_step <= PHASE_STEP_INITIAL;
             settle_counter <= '0;
             sample_counter <= '0;
@@ -439,6 +636,258 @@ module coherent_matmul_top
                 default: begin
                 end
             endcase
+
+            //---------------------------------------------------------------------
+            // SVD Calibration Datapath
+            //---------------------------------------------------------------------
+            if (svd_mode_latched) begin
+                case (svd_cal_state)
+                    SVD_CAL_IDLE: begin
+                        status.cal_locked <= 1'b0;
+                        status.cal_in_progress <= 1'b0;
+                        status.v_locked <= 1'b0;
+                        status.u_locked <= 1'b0;
+                        v_locked_reg <= 1'b0;
+                        u_locked_reg <= 1'b0;
+                        iteration_counter <= '0;
+                        lock_counter <= '0;
+                        phi_step <= PHASE_STEP_INITIAL;
+                        error_best <= '1;
+                        svd_component <= SVD_COMP_V;
+                    end
+
+                    SVD_CAL_VALIDATE: begin
+                        status.cal_in_progress <= 1'b1;
+                        status.error_weights <= ~weights_valid;
+                        svd_component <= SVD_COMP_V;
+                    end
+
+                    // V† calibration states
+                    SVD_CAL_APPLY_BASIS0_V, SVD_CAL_APPLY_BASIS1_V: begin
+                        settle_counter <= '0;
+                        sample_counter <= '0;
+                        i0_accum <= '0;
+                        q0_accum <= '0;
+                        i1_accum <= '0;
+                        q1_accum <= '0;
+                    end
+
+                    SVD_CAL_SETTLE0_V, SVD_CAL_SETTLE1_V: begin
+                        settle_counter <= settle_counter + 1'b1;
+                    end
+
+                    SVD_CAL_SAMPLE_COL0_V: begin
+                        if (adc_valid) begin
+                            sample_counter <= sample_counter + 1'b1;
+                            i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                            q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                            i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                            q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                        end
+                        if (sample_counter >= CAL_AVG_SAMPLES) begin
+                            m_hat_real[0] <= i0_accum[DATA_WIDTH_P+2:3];
+                            m_hat_imag[0] <= q0_accum[DATA_WIDTH_P+2:3];
+                            m_hat_real[2] <= i1_accum[DATA_WIDTH_P+2:3];
+                            m_hat_imag[2] <= q1_accum[DATA_WIDTH_P+2:3];
+                        end
+                    end
+
+                    SVD_CAL_SAMPLE_COL1_V: begin
+                        if (adc_valid) begin
+                            sample_counter <= sample_counter + 1'b1;
+                            i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                            q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                            i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                            q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                        end
+                        if (sample_counter >= CAL_AVG_SAMPLES) begin
+                            m_hat_real[1] <= i0_accum[DATA_WIDTH_P+2:3];
+                            m_hat_imag[1] <= q0_accum[DATA_WIDTH_P+2:3];
+                            m_hat_real[3] <= i1_accum[DATA_WIDTH_P+2:3];
+                            m_hat_imag[3] <= q1_accum[DATA_WIDTH_P+2:3];
+                        end
+                    end
+
+                    SVD_CAL_COMPUTE_ERR_V: begin
+                        error_current <= compute_error(m_hat_real, {w0, w1, w2, w3});
+                        phase_index <= '0;
+                        settle_counter <= '0;
+                        sample_counter <= '0;
+                    end
+
+                    SVD_CAL_PROBE_PLUS_V: begin
+                        settle_counter <= settle_counter + 1'b1;
+                        if (settle_counter == 0)
+                            phi_reg_v[phase_index] <= phi_reg_v[phase_index] + phi_step;
+                        if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES) begin
+                            error_probe_plus <= error_current;
+                            phi_reg_v[phase_index] <= phi_reg_v[phase_index] - phi_step;
+                            settle_counter <= '0;
+                            sample_counter <= '0;
+                        end
+                    end
+
+                    SVD_CAL_PROBE_MINUS_V: begin
+                        settle_counter <= settle_counter + 1'b1;
+                        if (settle_counter == 0)
+                            phi_reg_v[phase_index] <= phi_reg_v[phase_index] - phi_step;
+                        if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES)
+                            error_probe_minus <= error_current;
+                    end
+
+                    SVD_CAL_UPDATE_V: begin
+                        if (error_probe_plus < error_probe_minus && error_probe_plus < error_best) begin
+                            phi_reg_v[phase_index] <= phi_reg_v[phase_index] + phi_step + phi_step;
+                            error_best <= error_probe_plus;
+                        end else if (error_probe_minus < error_best) begin
+                            error_best <= error_probe_minus;
+                        end else begin
+                            phi_reg_v[phase_index] <= phi_reg_v[phase_index] + phi_step;
+                        end
+                        iteration_counter <= iteration_counter + 1'b1;
+                    end
+
+                    SVD_CAL_CHECK_V: begin
+                        if (error_best < CAL_LOCK_THRESHOLD) begin
+                            lock_counter <= lock_counter + 1'b1;
+                            if (lock_counter >= CAL_LOCK_COUNT - 1) begin
+                                v_locked_reg <= 1'b1;
+                                status.v_locked <= 1'b1;
+                            end
+                        end else begin
+                            lock_counter <= '0;
+                            if (iteration_counter[4:0] == '0 && phi_step > PHASE_STEP_MIN)
+                                phi_step <= phi_step >> PHASE_STEP_DECAY;
+                        end
+                        phase_index <= phase_index + 1'b1;
+                    end
+
+                    // Sigma assignment
+                    SVD_CAL_SET_SIGMA: begin
+                        voa_reg[0] <= sigma_dac0;
+                        voa_reg[1] <= sigma_dac1;
+                        svd_component <= SVD_COMP_U;
+                        // Reset for U calibration
+                        lock_counter <= '0;
+                        phi_step <= PHASE_STEP_INITIAL;
+                        error_best <= '1;
+                        phase_index <= '0;
+                    end
+
+                    // U calibration states (same structure as V)
+                    SVD_CAL_APPLY_BASIS0_U, SVD_CAL_APPLY_BASIS1_U: begin
+                        settle_counter <= '0;
+                        sample_counter <= '0;
+                        i0_accum <= '0;
+                        q0_accum <= '0;
+                        i1_accum <= '0;
+                        q1_accum <= '0;
+                    end
+
+                    SVD_CAL_SETTLE0_U, SVD_CAL_SETTLE1_U: begin
+                        settle_counter <= settle_counter + 1'b1;
+                    end
+
+                    SVD_CAL_SAMPLE_COL0_U: begin
+                        if (adc_valid) begin
+                            sample_counter <= sample_counter + 1'b1;
+                            i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                            q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                            i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                            q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                        end
+                        if (sample_counter >= CAL_AVG_SAMPLES) begin
+                            m_hat_real[0] <= i0_accum[DATA_WIDTH_P+2:3];
+                            m_hat_imag[0] <= q0_accum[DATA_WIDTH_P+2:3];
+                            m_hat_real[2] <= i1_accum[DATA_WIDTH_P+2:3];
+                            m_hat_imag[2] <= q1_accum[DATA_WIDTH_P+2:3];
+                        end
+                    end
+
+                    SVD_CAL_SAMPLE_COL1_U: begin
+                        if (adc_valid) begin
+                            sample_counter <= sample_counter + 1'b1;
+                            i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                            q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                            i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                            q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                        end
+                        if (sample_counter >= CAL_AVG_SAMPLES) begin
+                            m_hat_real[1] <= i0_accum[DATA_WIDTH_P+2:3];
+                            m_hat_imag[1] <= q0_accum[DATA_WIDTH_P+2:3];
+                            m_hat_real[3] <= i1_accum[DATA_WIDTH_P+2:3];
+                            m_hat_imag[3] <= q1_accum[DATA_WIDTH_P+2:3];
+                        end
+                    end
+
+                    SVD_CAL_COMPUTE_ERR_U: begin
+                        error_current <= compute_error(m_hat_real, {w0, w1, w2, w3});
+                        phase_index <= '0;
+                        settle_counter <= '0;
+                        sample_counter <= '0;
+                    end
+
+                    SVD_CAL_PROBE_PLUS_U: begin
+                        settle_counter <= settle_counter + 1'b1;
+                        if (settle_counter == 0)
+                            phi_reg_u[phase_index] <= phi_reg_u[phase_index] + phi_step;
+                        if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES) begin
+                            error_probe_plus <= error_current;
+                            phi_reg_u[phase_index] <= phi_reg_u[phase_index] - phi_step;
+                            settle_counter <= '0;
+                            sample_counter <= '0;
+                        end
+                    end
+
+                    SVD_CAL_PROBE_MINUS_U: begin
+                        settle_counter <= settle_counter + 1'b1;
+                        if (settle_counter == 0)
+                            phi_reg_u[phase_index] <= phi_reg_u[phase_index] - phi_step;
+                        if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES)
+                            error_probe_minus <= error_current;
+                    end
+
+                    SVD_CAL_UPDATE_U: begin
+                        if (error_probe_plus < error_probe_minus && error_probe_plus < error_best) begin
+                            phi_reg_u[phase_index] <= phi_reg_u[phase_index] + phi_step + phi_step;
+                            error_best <= error_probe_plus;
+                        end else if (error_probe_minus < error_best) begin
+                            error_best <= error_probe_minus;
+                        end else begin
+                            phi_reg_u[phase_index] <= phi_reg_u[phase_index] + phi_step;
+                        end
+                        iteration_counter <= iteration_counter + 1'b1;
+                    end
+
+                    SVD_CAL_CHECK_U: begin
+                        if (error_best < CAL_LOCK_THRESHOLD) begin
+                            lock_counter <= lock_counter + 1'b1;
+                            if (lock_counter >= CAL_LOCK_COUNT - 1) begin
+                                u_locked_reg <= 1'b1;
+                                status.u_locked <= 1'b1;
+                            end
+                        end else begin
+                            lock_counter <= '0;
+                            if (iteration_counter[4:0] == '0 && phi_step > PHASE_STEP_MIN)
+                                phi_step <= phi_step >> PHASE_STEP_DECAY;
+                        end
+                        phase_index <= phase_index + 1'b1;
+                    end
+
+                    SVD_CAL_LOCKED: begin
+                        status.cal_locked <= 1'b1;
+                        status.cal_in_progress <= 1'b0;
+                    end
+
+                    SVD_CAL_ERROR: begin
+                        status.error_timeout <= (iteration_counter >= CAL_MAX_ITERATIONS);
+                        status.cal_in_progress <= 1'b0;
+                    end
+
+                    default: begin
+                    end
+                endcase
+            end
         end
     end
 
@@ -474,21 +923,41 @@ module coherent_matmul_top
                 plant_enable = 1'b1;
                 plant_mode   = PLANT_CAL;
 
-                // Drive basis vectors for calibration
-                case (cal_state)
-                    CAL_APPLY_BASIS0, CAL_SETTLE0, CAL_SAMPLE_COL0: begin
-                        x_drive0 = Q1_15_ONE;  // 1.0
-                        x_drive1 = '0;          // 0.0
-                    end
-                    CAL_APPLY_BASIS1, CAL_SETTLE1, CAL_SAMPLE_COL1: begin
-                        x_drive0 = '0;          // 0.0
-                        x_drive1 = Q1_15_ONE;  // 1.0
-                    end
-                    default: begin
-                        x_drive0 = '0;
-                        x_drive1 = '0;
-                    end
-                endcase
+                if (svd_mode_latched) begin
+                    // SVD mode: drive basis vectors based on SVD FSM state
+                    case (svd_cal_state)
+                        SVD_CAL_APPLY_BASIS0_V, SVD_CAL_SETTLE0_V, SVD_CAL_SAMPLE_COL0_V,
+                        SVD_CAL_APPLY_BASIS0_U, SVD_CAL_SETTLE0_U, SVD_CAL_SAMPLE_COL0_U: begin
+                            x_drive0 = Q1_15_ONE;
+                            x_drive1 = '0;
+                        end
+                        SVD_CAL_APPLY_BASIS1_V, SVD_CAL_SETTLE1_V, SVD_CAL_SAMPLE_COL1_V,
+                        SVD_CAL_APPLY_BASIS1_U, SVD_CAL_SETTLE1_U, SVD_CAL_SAMPLE_COL1_U: begin
+                            x_drive0 = '0;
+                            x_drive1 = Q1_15_ONE;
+                        end
+                        default: begin
+                            x_drive0 = '0;
+                            x_drive1 = '0;
+                        end
+                    endcase
+                end else begin
+                    // Unitary mode: drive basis vectors for calibration
+                    case (cal_state)
+                        CAL_APPLY_BASIS0, CAL_SETTLE0, CAL_SAMPLE_COL0: begin
+                            x_drive0 = Q1_15_ONE;  // 1.0
+                            x_drive1 = '0;          // 0.0
+                        end
+                        CAL_APPLY_BASIS1, CAL_SETTLE1, CAL_SAMPLE_COL1: begin
+                            x_drive0 = '0;          // 0.0
+                            x_drive1 = Q1_15_ONE;  // 1.0
+                        end
+                        default: begin
+                            x_drive0 = '0;
+                            x_drive1 = '0;
+                        end
+                    endcase
+                end
             end
 
             TOP_EVAL: begin
@@ -505,10 +974,35 @@ module coherent_matmul_top
         endcase
     end
 
-    // Phase DAC outputs
+    //-------------------------------------------------------------------------
+    // Phase and VOA DAC output assignments
+    //-------------------------------------------------------------------------
     always_comb begin
-        for (int i = 0; i < NUM_PHASES_P; i++) begin
-            phi_dac[i] = phi_reg[i];
+        if (svd_mode_latched) begin
+            // SVD mode: route all 10 parameters
+            for (int i = 0; i < NUM_PHASES_V; i++) begin
+                phi_dac_v[i] = phi_reg_v[i];
+            end
+            for (int i = 0; i < NUM_PHASES_U; i++) begin
+                phi_dac_u[i] = phi_reg_u[i];
+            end
+            voa_dac[0] = voa_reg[0];
+            voa_dac[1] = voa_reg[1];
+
+            // Legacy interface gets V† phases for backward compatibility
+            for (int i = 0; i < NUM_PHASES_P; i++) begin
+                phi_dac[i] = phi_reg_v[i];
+            end
+        end else begin
+            // Unitary mode: original behavior
+            for (int i = 0; i < NUM_PHASES_P; i++) begin
+                phi_dac[i] = phi_reg[i];
+                phi_dac_v[i] = phi_reg[i];
+                phi_dac_u[i] = '0;
+            end
+            // VOAs at full transmission (no attenuation)
+            voa_dac[0] = VOA_FULL_TRANSMISSION;
+            voa_dac[1] = VOA_FULL_TRANSMISSION;
         end
     end
 

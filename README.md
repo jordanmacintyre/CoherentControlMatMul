@@ -1,269 +1,205 @@
-# CoherentControlMatMul
+# Coherent Photonic Matrix Multiply
 
-Closed-loop coherent photonic matrix multiplication with output-driven phase control.
+Closed-loop coherent photonic 2×2 matrix multiplication with output-driven phase control.
 
-## Overview
+## What This Does
 
-This project implements a simulation of a **coherent (I/Q) 2×2 photonic matrix multiply block**:
-
-- User specifies a target matrix **M** (weights w₀..w₃ in [-1, 1])
-- A photonic fabric (MZI mesh with thermal phase shifters) implements a transform **M̂(φ)**
-- A digital controller programs phases using **only coherent I/Q measurements** as feedback
-- Once "locked," the system processes inputs **x** and produces outputs **y = M̂·x**
-
-**Key principle**: User weights define the desired behavior, not phase setpoints. Phase setpoints are internal control variables continuously adjusted based on output error.
-
-## Architecture
+This system implements **hardware-in-the-loop calibration** for a photonic matrix multiplier:
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         cocotb Testbench                            │
-│  ┌──────────────┐    ┌─────────────────┐    ┌──────────────────┐   │
-│  │ Test Driver  │───▶│  RTL Controller │◀──▶│ Python Plant     │   │
-│  │ (weights, x) │    │   (Verilator)   │    │ (photonic model) │   │
-│  └──────────────┘    └─────────────────┘    └──────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
+User provides: Target matrix M = [[w₀, w₁], [w₂, w₃]]
+System does:   Adjusts optical phases until photonic output matches M·x
+Result:        Hardware computes y = M·x at the speed of light
 ```
+
+The key insight is that **users specify what they want (matrix weights), not how to get it (phase values)**. The calibration loop finds the phases automatically using only I/Q measurements as feedback.
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.10+
-- Verilator 5.0+
-- conda (for environment management)
-
-### Setup
-
 ```bash
-# Activate the photonics conda environment
-conda activate photonics
-
-# Install dependencies
+# Install
 pip install -e .
+
+# Run with a Hadamard matrix
+python run.py --weights 0.707 0.707 0.707 -0.707 --input 1.0 0.5
+
+# Use SVD mode for non-unitary matrices
+python run.py --svd --weights 0.5 0 0 0.3 --input 1.0 1.0
+
+# Save results with plots
+python run.py --weights 1 0 0 1 --input 1.0 0.0 --save-results --verbose
 ```
 
-### Run the Demo
+## Two Operating Modes
+
+### Standard Mode (Unitary Matrices)
+
+Single MZI mesh with 4 phase controls. Works for matrices where M†M = I:
 
 ```bash
-# Run the Python control loop demo with visualizations
-python demo/run_demo.py
-
-# Interactive mode
-python demo/run_demo.py --interactive
-
-# Animated demo (shows real-time calibration)
-python demo/run_demo.py --animated
-
-# Save plots without display (headless)
-python demo/run_demo.py --no-display --save-plots
+python run.py --weights 0.707 0.707 0.707 -0.707 --input 1.0 0.5
 ```
 
-### Run RTL Simulation
+Suitable for: Identity, Swap, Hadamard, rotations, permutations.
+
+### SVD Mode (Any Matrix)
+
+Two MZI meshes + variable attenuators. Works for **any** 2×2 matrix:
 
 ```bash
-# Run calibration tests with Verilator
-make sim
+# Standard SVD (weights in [-1, 1])
+python run.py --svd --weights 0.7 -0.3 0.2 -0.5 --input 1.0 0.5
 
-# Run specific test modules
-make test-cal      # Calibration tests
-make test-compute  # Compute correctness tests
-make test-drift    # Drift robustness tests
-
-# Clean simulation artifacts
-make clean-sim
+# Large weights (auto-scaled)
+python run.py --svd --weights 2.0 -1.5 3.0 -2.5 --input 1.0 0.5
 ```
+
+Uses SVD decomposition: M = U·Σ·V† where U, V† are unitary (MZI meshes) and Σ is diagonal (VOAs).
+
+**Auto-scaling**: When singular values exceed 1.0, the system automatically normalizes the matrix and scales the outputs in software. This enables weights of any magnitude.
+
+## Command Reference
+
+```
+python run.py [OPTIONS]
+
+Required:
+  --weights W0 W1 W2 W3    Target matrix [[W0,W1],[W2,W3]]
+                           Range [-1,1] for unitary mode; any values for --svd
+
+Optional:
+  --input X0 X1            Input vector (can specify multiple times)
+  --svd                    Use SVD architecture for arbitrary matrices (auto-scales)
+  --noise N                Receiver noise std dev (default: 2.0)
+  --max-iterations N       Max calibration iterations (default: 300)
+  --error-threshold E      Lock threshold (default: 2e-3)
+  --verbose, -v            Show detailed output
+  --save-results, -s       Save to sim/results/<timestamp>/
+  --seed N                 Random seed for reproducibility
+```
+
+## How It Works
+
+### The Calibration Problem
+
+Given a target matrix M, find phase values φ = [θ, φ₀, φ₁, φ_out] such that the MZI transfer matrix matches M.
+
+The MZI implements:
+```
+M̂(φ) = [[e^{j(φ₀+φ₁)}cos(θ/2), -e^{jφ₁}sin(θ/2)],
+         [e^{j(φ₀+φ_out)}sin(θ/2), e^{jφ_out}cos(θ/2)]]
+```
+
+For **real** target matrices, we want M̂_real ≈ M and M̂_imag ≈ 0.
+
+### Calibration Algorithm
+
+**Coordinate descent** with adaptive step sizing:
+
+1. Apply basis inputs [1,0] and [0,1]
+2. Measure I/Q outputs via coherent receiver
+3. Compute error: ‖M̂_real - M_target‖² + ‖M̂_imag‖²
+4. For each phase, try ±Δ and keep the direction that reduces error
+5. Decay step size when no improvement
+6. Lock when error stays below threshold for N consecutive iterations
+
+### Why Coordinate Descent?
+
+- **Noise robust**: Discrete ±Δ probing handles measurement noise better than gradient estimation
+- **No derivatives**: Avoids numerical differentiation issues
+- **Hardware-friendly**: Simple comparisons, easy to implement in RTL
+- **Adaptive**: Step decay prevents oscillation near optimum
+
+### Why Not Analytical?
+
+The mapping from target matrix to phases is non-linear and affected by:
+- Manufacturing variations
+- Thermal drift
+- Heater crosstalk
+
+Closed-loop calibration adapts to real conditions; analytical solutions assume ideal hardware.
+
+## Architecture
+
+### Standard Mode
+```
+Input x → [MZI (4 phases)] → Output y = M̂·x
+```
+
+### SVD Mode
+```
+Input x → [MZI V†] → [VOA Σ] → [MZI U] → Output y = U·Σ·V†·x
+         4 phases   2 gains   4 phases
+```
+
+The SVD architecture can realize **any** matrix with singular values ≤ 1.
+
+## Physical Models
+
+### MZI Mesh
+- Reck/Clements decomposition structure
+- 4 thermal phase shifters
+- Can realize any 2×2 unitary
+
+### Thermal Dynamics
+- RC time constant: τ = 100μs (configurable)
+- Random drift: Brownian motion model
+- Crosstalk: 5% coupling to adjacent heaters
+
+### Coherent Receiver
+
+The coherent receiver extracts both the **amplitude** and **phase** of the optical signal using I/Q (In-phase/Quadrature) detection:
+
+```
+                    ┌─────────────┐
+Signal E(t) ───────►│ 90° Hybrid  │──► I = Re{E} = |E|cos(φ)
+                    │             │
+LO (reference) ────►│             │──► Q = Im{E} = |E|sin(φ)
+                    └─────────────┘
+```
+
+- **I (In-phase)**: The real component of the complex field. Measures projection onto the reference.
+- **Q (Quadrature)**: The imaginary component. Measures projection 90° out of phase.
+- **Together**: I + jQ = E recovers the full complex field, including sign information.
+
+This is essential because:
+- Direct detection (photodiode) only measures |E|², losing phase
+- With I/Q, we can distinguish +0.5 from -0.5 (same power, opposite sign)
+- Matrix calibration needs signed values to achieve negative weights
+
+Hardware:
+- Dual I/Q detection (both output ports)
+- Transimpedance gain: 1000
+- Gaussian noise model
+- 12-bit ADC quantization
+
+### Variable Optical Attenuators (SVD mode)
+- 16-bit DAC control
+- 40 dB attenuation range
+- Maps singular values σ ∈ [0,1] to optical transmission
 
 ## Project Structure
 
 ```
 CoherentControlMatMul/
-├── rtl/                           # SystemVerilog RTL
-│   ├── pkg_types.sv               # Type definitions & parameters
-│   └── coherent_matmul_top.sv     # Top-level controller
-│
-├── plant/                         # Python photonic plant model
-│   ├── mzi_mesh.py                # MZI transfer functions
-│   ├── thermal_dynamics.py        # Heater thermal model
-│   ├── coherent_receiver.py       # I/Q detection + noise
-│   └── plant_wrapper.py           # Unified interface
-│
-├── demo/                          # Interactive demonstration
-│   ├── control_loop.py            # Python control algorithm
-│   ├── visualizer.py              # Plotting utilities
-│   └── run_demo.py                # Main demo script
-│
-├── tests/                         # cocotb testbenches
-│   ├── test_calibration.py        # Calibration convergence
-│   ├── test_compute.py            # Compute correctness
-│   ├── test_drift.py              # Drift robustness
-│   └── utils/                     # Test utilities
-│
-├── sim/                           # Simulation artifacts
-│   ├── obj_dir/                   # Verilator build
-│   └── results/                   # Test results & plots
-│
-├── Makefile                       # cocotb + Verilator build
-└── pyproject.toml                 # Python package config
+├── run.py                     # Main entry point
+├── plant/                     # Photonic hardware models
+│   ├── mzi_mesh.py           # MZI transfer matrix
+│   ├── thermal_dynamics.py   # Heater RC model + drift
+│   ├── coherent_receiver.py  # I/Q detection + noise
+│   ├── voa.py                # Variable attenuators
+│   ├── svd_plant.py          # SVD architecture wrapper
+│   └── plant_wrapper.py      # Unified interface
+├── demo/                      # Control algorithms
+│   ├── control_loop.py       # Standard (unitary) controller
+│   ├── svd_control_loop.py   # SVD controller
+│   ├── visualizer.py         # Plotting utilities
+│   └── run_demo.py           # Demo with visualizations
+├── rtl/                       # SystemVerilog (for cocotb)
+└── sim/results/               # Experiment outputs
 ```
 
-## How It Works
-
-### 1. Target Matrix
-
-The user specifies a 2×2 real matrix:
-
-```
-M = [[w₀, w₁],
-     [w₂, w₃]]
-```
-
-where each weight wᵢ ∈ [-1, 1].
-
-### 2. MZI Mesh
-
-The photonic fabric uses an MZI (Mach-Zehnder Interferometer) mesh with 4 phase shifters:
-
-- **θ**: Internal splitting angle (controls power distribution)
-- **φ₀, φ₁**: Input port phases
-- **φ_out**: Global output phase
-
-The transfer matrix is:
-
-```
-M̂(φ) = e^{jφ_out} · [[e^{jφ₀}·cos(θ/2),  j·sin(θ/2)],
-                      [j·sin(θ/2),         e^{jφ₁}·cos(θ/2)]]
-```
-
-### 3. Calibration Algorithm
-
-The controller uses **coordinate descent** optimization:
-
-1. **Measure matrix**: Apply basis inputs [1,0] and [0,1], measure I/Q outputs
-2. **Compute error**: ‖M̂_real - M_target‖² + ‖M̂_imag‖²
-3. **Update phases**: For each phase, try ±Δ and keep the direction that reduces error
-4. **Converge**: Lock when error stays below threshold for N iterations
-
-### 4. Thermal Dynamics
-
-The plant model includes realistic thermal effects:
-
-- **RC time constant**: First-order exponential response (~100μs)
-- **Random drift**: Brownian motion phase drift
-- **Crosstalk**: Coupling between adjacent heaters
-
-### 5. Coherent Receiver
-
-The I/Q detection model includes:
-
-- **Transimpedance gain**: Converts optical field to voltage
-- **Noise**: Thermal/shot noise
-- **ADC quantization**: 12-bit resolution with clipping
-
-## Standard Target Matrices
-
-The demo (`demo/run_demo.py`) calibrates to three standard matrices that represent common linear transformations:
-
-### Identity Matrix
-```
-M = [[1, 0],
-     [0, 1]]
-```
-**Effect**: y = x (pass-through)
-- Output equals input: y₀ = x₀, y₁ = x₁
-- Useful as a baseline test - if calibration works, the system should reproduce inputs exactly
-- **Weights**: `--weights 1 0 0 1`
-
-### Swap Matrix
-```
-M = [[0, 1],
-     [1, 0]]
-```
-**Effect**: Exchanges the two inputs
-- y₀ = x₁, y₁ = x₀
-- Tests the system's ability to route signals between ports
-- Requires significant phase adjustment to redirect light paths
-- **Weights**: `--weights 0 1 1 0`
-
-### Hadamard Matrix
-```
-M = [[0.707,  0.707],
-     [0.707, -0.707]]
-```
-**Effect**: Creates equal superposition with phase difference
-- y₀ = (x₀ + x₁)/√2 (sum)
-- y₁ = (x₀ - x₁)/√2 (difference)
-- Fundamental operation in signal processing and quantum computing
-- Tests precise amplitude control (50/50 splitting)
-- **Weights**: `--weights 0.707 0.707 0.707 -0.707`
-
-### Custom Matrices
-
-The `run.py` script accepts **any** user-specified matrix via `--weights`. Examples:
-
-```bash
-# Attenuator (50% gain)
-python run.py --weights 0.5 0 0 0.5 --input 1.0 1.0
-
-# Rotation-like matrix
-python run.py --weights 0.866 -0.5 0.5 0.866 --input 1.0 0.0
-
-# Asymmetric mixing
-python run.py --weights 0.8 0.2 -0.3 0.9 --input 0.5 0.5
-```
-
-### Realizability Constraints
-
-**Not all 2×2 matrices can be exactly realized** by the MZI mesh due to physical constraints.
-
-The MZI mesh implements **unitary** (or scaled unitary) transformations. A matrix is unitary if M†M = I, meaning:
-- Columns are orthonormal: |col₀|² = |col₁|² = 1, and col₀ · col₁ = 0
-- Rows are orthonormal: |row₀|² = |row₁|² = 1, and row₀ · row₁ = 0
-
-**Examples of realizable matrices** (unitary or scaled unitary):
-```
-Identity:  [[1, 0], [0, 1]]           ✓ Unitary
-Swap:      [[0, 1], [1, 0]]           ✓ Unitary
-Hadamard:  [[0.707, 0.707],           ✓ Unitary
-            [0.707, -0.707]]
-Rotation:  [[cos θ, -sin θ],          ✓ Unitary
-            [sin θ,  cos θ]]
-```
-
-**Examples of non-realizable matrices**:
-```
-[[0.91, -0.32],    ✗ Not unitary (rows not orthogonal)
- [0.15, -0.74]]
-
-[[0.5, 0], [0, 0.5]]  ✓ Scaled identity (realizable with loss)
-[[0.8, 0.2], [0.3, 0.9]]  ✗ Not unitary
-```
-
-**How to check**: A matrix M is approximately unitary if:
-- `np.allclose(M @ M.T, np.eye(2))` for real matrices
-- Row/column norms ≈ 1
-
-When calibration fails to lock, the target matrix likely violates unitarity constraints. The system will find the **closest achievable** approximation, but with high residual error.
-
-## Main Run Script
-
-The `run.py` script provides a complete workflow: specify a target matrix, calibrate the photonic system, compute matrix-vector products, and compare against floating-point reference.
-
-```bash
-# Basic usage: specify matrix weights and input vector
-python run.py --weights 0.707 0.707 0.707 -0.707 --input 1.0 0.5
-
-# Multiple input vectors
-python run.py --weights 1 0 0 1 --input 1.0 0.0 --input 0.5 0.5 --input -1.0 1.0
-
-# Custom noise and save results
-python run.py --weights 0.5 -0.3 0.8 0.2 --input 1.0 1.0 --noise 5.0 --save-results
-
-# Verbose output with all intermediate values
-python run.py --weights 0 1 1 0 --input 0.5 0.5 --verbose
-```
-
-### Output Example
+## Example Output
 
 ```
 ╔══════════════════════════════════════════════════════════╗
@@ -271,258 +207,180 @@ python run.py --weights 0 1 1 0 --input 0.5 0.5 --verbose
 ╚══════════════════════════════════════════════════════════╝
 
 Target Matrix:
-  [[ 0.7070,  0.7070],
-   [ 0.7070, -0.7070]]
+  [[0.7000, -0.3000],
+   [0.2000, -0.5000]]
+
+Using SVD architecture (M = U·Σ·V†)
+
+SVD Decomposition:
+  Singular values: σ = [0.8713, 0.3328]
 
 Calibrating photonic system...
-  ✓ LOCKED in 25 iterations (error: 1.43e-03)
+  ✓ LOCKED in 5 iterations (error: 1.04e-05)
 
 Computing y = M·x for input vectors:
-──────────────────────────────────────────────────────────
-  Input x         Photonic y       Reference y      Error
-──────────────────────────────────────────────────────────
-  [1.00, 0.50]    [1.06, 0.35]     [1.06, 0.35]    2.1e-03
-──────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────
+  Input x          Photonic y       Reference y      Error
+────────────────────────────────────────────────────────────
+  [1.00, 0.50]     [0.55, -0.05]    [0.55, -0.05]    7.9e-04
+────────────────────────────────────────────────────────────
 
 Summary:
-  Max absolute error: 2.1e-03
-  RMS error: 1.8e-03
-```
-
-## Output Plots
-
-When running with `--save-plots`, the demo generates several visualization plots saved to timestamped experiment directories under `sim/results/`.
-
-### Summary Plot (6-panel overview)
-
-The main summary plot contains six panels providing a complete view of the calibration:
-
-```
-┌─────────────────┬─────────────────┬─────────────────┐
-│   Convergence   │  Phases φ₀-φ₁  │  Phases φ₂-φ₃  │
-├─────────────────┼─────────────────┼─────────────────┤
-│  Matrix Heatmap │   M₀₀ I/Q      │   M₁₁ I/Q      │
-└─────────────────┴─────────────────┴─────────────────┘
-```
-
-**Panel 1: Convergence** (top-left)
-- **Y-axis (log scale)**: Calibration error = ‖M̂_real - M_target‖² + ‖M̂_imag‖²
-- **X-axis**: Iteration number
-- **Red dashed line**: Error threshold for lock condition
-- **What to look for**: Exponential decay followed by plateau below threshold indicates successful calibration
-
-**Panels 2-3: Phase Trajectories** (top-center, top-right)
-- **Y-axis**: Phase value in radians
-- **X-axis**: Iteration number
-- **Four phases**: θ (splitting angle), φ₀ (input 0), φ₁ (input 1), φ_out (global output)
-- **What to look for**: Phases should stabilize as error decreases; oscillations indicate step size issues
-
-**Panel 4: Final Matrix Heatmap** (bottom-left)
-- **Color scale**: Red-Blue diverging colormap, range [-1, 1]
-- **Each cell shows**: Measured value (top) and target value (bottom)
-- **What to look for**: Colors should match target; near-zero error means good calibration
-
-**Panels 5-6: I/Q Constellation Diagrams** (bottom-center, bottom-right)
-- **Axes**: In-phase (I) vs Quadrature (Q) components
-- **Green circle**: Starting point (random initial phases)
-- **Red square**: Final converged point
-- **Blue star**: Target value (always on real axis since targets are real)
-- **Gray dashed circle**: Unit circle (|z| = 1)
-- **Color gradient**: Time progression (purple → yellow)
-- **What to look for**: Trajectory should spiral toward the blue target star; final Q component should be near zero
-
-### Understanding the I/Q Plane
-
-The coherent receiver measures both In-phase (I) and Quadrature (Q) components of the optical field. For a **real** target matrix:
-- **Target position**: Always on the real axis (Q = 0)
-- **Ideal result**: Final measurement lands on target with Q ≈ 0
-- **Imaginary residual**: Non-zero Q indicates phase error in the photonic circuit
-
-### Experiment Data Files
-
-Each calibration run saves:
-- `calibration_<name>.png`: Summary plot for that target matrix
-- `calibration_<name>.json`: Machine-readable data including:
-  - Target weights and name
-  - Final phases (φ₀, φ₁, φ₂, φ₃)
-  - Convergence iterations and final error
-  - Controller configuration
-- `summary.json`: Aggregated results for all matrices in the run
-
-## Example Results
-
-Running the demo produces calibration results like:
-
-```
-Target: Identity
-  M = [[ 1.0000,  0.0000],
-       [ 0.0000,  1.0000]]
-  ✓ LOCKED in 24 iterations
-    Final error: 6.47e-04
-
-Target: Hadamard
-  M = [[ 0.7070,  0.7070],
-       [ 0.7070, -0.7070]]
-  ✓ LOCKED in 25 iterations
-    Final error: 1.43e-03
+  Max absolute error: 7.5e-04
+  RMS error: 5.6e-04
 ```
 
 ## Design Decisions
 
-### Summary Table
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Matrix size | 2×2 | Simplest case; scales via Clements/Reck |
+| Weights | Real, any value | SVD + auto-scaling handles arbitrary matrices |
+| Architecture | MZI + optional SVD | Unitary fast, SVD universal |
+| Calibration | Coordinate descent | Noise-robust, hardware-friendly |
+| Detection | Coherent I/Q | Preserves phase, enables signed values |
+| Thermal model | Full RC + drift | Realistic control challenges |
+| Large matrices | Auto-scale + software multiply | Photonic attenuation only; gain in software |
 
-| Decision | Choice | Alternatives Considered |
-|----------|--------|------------------------|
-| Matrix size | 2×2 only | N×N generalizable |
-| Weight type | Real-only [-1, 1] | Complex weights |
-| Architecture | Single MZI mesh | SVD (U·Σ·V†) decomposition |
-| Calibration | Coordinate descent | Gradient descent, analytical |
-| Detection | Coherent I/Q | Direct detection (power only) |
-| Thermal model | Full dynamics | Instantaneous or simplified |
-| Fixed-point | Q1.15 weights, Q2.14 phase | Floating-point |
+### Why Coherent Detection?
 
-### Detailed Rationale
+Direct detection (photodiode) measures power |E|², losing phase information. Coherent detection preserves the complex field, enabling:
+- Signed matrix elements (positive and negative)
+- Full complex matrix recovery
+- Linear relationship between field and output
 
-#### Why 2×2 Matrix Size?
+### Why Output-Driven Control?
 
-**Choice**: Fixed 2×2 matrix multiplication
+**Alternative**: Pre-compute phase setpoints from target matrix.
 
-**Rationale**:
-- Simplest non-trivial case that demonstrates all key concepts
-- Single MZI naturally implements 2×2 unitary transforms
-- Scales to N×N via Clements/Reck decomposition (cascaded 2×2 blocks)
-- Keeps RTL complexity manageable for demonstration
+**Problem**: Real hardware has:
+- Manufacturing variations
+- Temperature drift
+- Aging effects
+- Crosstalk
 
-**Trade-off**: Larger matrices (4×4, 8×8) would be more practical for neural network inference but require O(N²) MZIs and significantly more complex calibration.
+Output-driven control adapts to these automatically. No per-device calibration tables needed.
 
-#### Why Real-Only Weights?
+## Realizability
 
-**Choice**: Weights constrained to w ∈ [-1, 1] (real numbers only)
+### Standard Mode (Unitary Only)
 
-**Rationale**:
-- Most neural network weights are real-valued
-- Simplifies user interface (4 floats vs 8 for complex)
-- Calibration targets real axis in I/Q plane (Q = 0)
-- Reduces calibration degrees of freedom
+A matrix M is realizable if M†M = I (unitary). Check:
+```python
+np.allclose(M @ M.T, np.eye(2))  # Should be True
+```
 
-**Trade-off**: Cannot implement arbitrary phase shifts in the matrix. For applications requiring complex weights (e.g., Fourier transforms), would need to extend to complex targets with separate I/Q weight inputs.
+Examples:
+- ✓ Identity, Swap, Hadamard, rotations
+- ✗ [[0.5, 0], [0, 0.3]] (not unitary)
 
-#### Why Single MZI Mesh (Not SVD Decomposition)?
+### SVD Mode (Universal with Auto-Scaling)
 
-**Choice**: Single MZI mesh that can only realize unitary matrices
+SVD mode can realize **any** 2×2 real matrix through automatic scaling:
 
-**Alternatives**:
-1. **SVD decomposition**: M = U·Σ·V† using two MZI meshes + variable attenuators
-2. **Coherent + incoherent hybrid**: MZI for unitary, photodetector/modulator for scaling
+```python
+# Any matrix works - auto-scaling handles large values
+python run.py --svd --weights 2.0 -1.5 3.0 -2.5 --input 1.0 0.5
+```
 
-**Rationale**:
-- Demonstrates core coherent control principles without added complexity
-- Many practical matrices (rotations, Hadamard, permutations) are already unitary
-- For neural networks, weights can be trained with unitarity constraints
-- Avoids need for variable optical attenuators (VOAs) in the model
+**How it works:**
+1. Compute SVD: M = U·Σ·V†
+2. If max(σ) > 1.0, normalize: M_norm = M / max(σ)
+3. Calibrate photonic system to realize M_norm
+4. Scale outputs in software: y = max(σ) × y_photonic
 
-**Trade-off**: Cannot exactly realize non-unitary matrices. System approximates with residual error. Production systems typically use SVD decomposition for arbitrary matrix support.
+**Example with auto-scaling:**
+```
+Target Matrix:
+  [[2.0000, -1.5000],
+   [3.0000, -2.5000]]
 
-#### Why Coordinate Descent (Not Gradient Descent)?
+SVD Decomposition:
+  Singular values: σ = [4.6356, 0.1079]
 
-**Choice**: Coordinate descent with adaptive step sizing
+  ╔═══════════════════════════════════════════════════════╗
+  ║  AUTO-SCALING APPLIED                                 ║
+  ╠═══════════════════════════════════════════════════════╣
+  ║  Original σ_max = 4.6356 > 1.0                        ║
+  ║  Matrix normalized by factor: 4.6356                  ║
+  ║  Photonic outputs will be scaled by 4.6356×           ║
+  ╚═══════════════════════════════════════════════════════╝
 
-**Alternatives**:
-1. **Gradient descent**: Update all phases simultaneously based on gradient
-2. **Analytical solution**: Directly compute phases from target matrix
-3. **Particle swarm / genetic algorithms**: Global optimization
+Computing y = M·x for input vectors:
+  (Photonic outputs scaled by 4.6356× to match original matrix)
+```
 
-**Rationale**:
-- **Robust to noise**: Discrete ±Δ probing is less sensitive to measurement noise than gradient estimation
-- **No gradient computation**: Avoids numerical differentiation issues
-- **Hardware-friendly**: Simple comparisons, no floating-point division
-- **Adaptive**: Step size decay prevents oscillation near optimum
+This approach:
+- Works for any real matrix (no restrictions on weight values)
+- Preserves full precision of the photonic system
+- Applies scaling in software (simple multiply)
 
-**Why not analytical?** The mapping from target matrix to phases is non-linear and affected by manufacturing variations, thermal drift, and crosstalk. Analytical solutions assume ideal hardware; closed-loop calibration adapts to real conditions.
+## RTL Implementation
 
-**Why not gradient descent?** Gradient estimation via finite differences requires 2N measurements per iteration (for N phases). Coordinate descent with multi-step probing achieves similar convergence with better noise immunity.
+The `rtl/` directory contains SystemVerilog implementing the calibration controller for both unitary and SVD modes.
 
-#### Why Coherent (I/Q) Detection?
+### Software/Hardware Boundary
 
-**Choice**: Coherent receiver measuring both In-phase (I) and Quadrature (Q) components
+| Component | Software (Python) | Hardware (RTL) |
+|-----------|-------------------|----------------|
+| SVD decomposition | ✓ `np.linalg.svd(M)` | - |
+| σ → DAC conversion | ✓ `voa.sigma_to_dac()` | - |
+| Calibration FSM | - | ✓ coordinate descent |
+| I/Q measurement | - | ✓ ADC sampling |
+| Phase DAC output | - | ✓ 10 DAC channels |
+| Error computation | - | ✓ fixed-point |
 
-**Alternative**: Direct detection (photodiode measuring optical power only)
+### SVD Handoff Protocol
 
-**Rationale**:
-- **Phase information**: Coherent detection preserves phase, essential for complex matrix elements
-- **Linear in field**: Output proportional to electric field amplitude, not intensity
-- **Sign preservation**: Can distinguish positive and negative matrix elements
-- **Full matrix recovery**: Can measure all 4 complex elements of 2×2 matrix
+```
+Software                          Hardware (RTL)
+────────                          ──────────────
+1. Compute SVD: M = U·Σ·V†
+2. Convert σ → DAC codes
+3. Write sigma_dac0, sigma_dac1  →  Stores in voa_reg[]
+4. Set svd_mode = 1              →  Enters SVD calibration
+5. Assert start_cal              →  Begins calibration
+                                    ...calibrates V† (4 phases)...
+                                    Sets VOA from sigma_dac inputs
+                                    ...calibrates U (4 phases)...
+                                 ←  cal_locked asserts
+6. Read cal_locked
+7. Assert start_eval with x0,x1  →  Computes y = M·x
+                                 ←  y0_out, y1_out, y_valid
+```
 
-**Trade-off**: Requires local oscillator (LO) laser and more complex receiver. Direct detection is simpler but loses phase information—would require interferometric techniques to recover matrix elements.
+### RTL Interface (SVD Mode)
 
-#### Why Full Thermal Dynamics?
+```systemverilog
+// Inputs
+input  logic        svd_mode,      // 1 = SVD, 0 = unitary
+input  logic [15:0] sigma_dac0,    // Pre-computed σ₀ VOA code
+input  logic [15:0] sigma_dac1,    // Pre-computed σ₁ VOA code
 
-**Choice**: Complete thermal model with RC time constant, drift, and crosstalk
+// Outputs (10 control parameters)
+output logic [15:0] phi_dac_v[4],  // V† mesh phases
+output logic [15:0] voa_dac[2],    // Σ attenuators
+output logic [15:0] phi_dac_u[4],  // U mesh phases
 
-**Alternatives**:
-1. **Instantaneous**: Phase follows DAC immediately
-2. **RC only**: First-order response, no drift or crosstalk
-3. **Lookup table**: Pre-characterized phase-vs-DAC curves
+// Status
+output logic        cal_locked,    // Calibration complete
+output logic [7:0]  status_flags,  // Includes v_locked, u_locked
+```
 
-**Rationale**:
-- **Realistic control challenges**: Exposes timing constraints and stability issues
-- **Drift compensation**: Tests controller's ability to track slow variations
-- **Crosstalk handling**: Adjacent heater coupling is significant in integrated photonics (~5%)
-- **Verification value**: Catches bugs that wouldn't appear with ideal models
+### DAC Code Layout
 
-**Parameters chosen**:
-- τ_thermal = 100μs (typical for silicon photonic heaters)
-- Drift rate = 0.001 rad/s (slow environmental changes)
-- Crosstalk = 5% (typical for closely-spaced heaters)
+```
+Index:   0   1   2   3   4   5   6   7   8   9
+         v0  v1  v2  v3  σ0  σ1  u0  u1  u2  u3
+         └── V† mesh ──┘  └VOA┘  └── U mesh ──┘
+```
 
-#### Why Q1.15 and Q2.14 Fixed-Point?
+### Why This Split?
 
-**Choice**:
-- Weights: Q1.15 (1 sign bit, 15 fractional bits) → range [-1, 1)
-- Phases: Q2.14 (1 sign bit, 1 integer bit, 14 fractional bits) → range [-2, 2)
-
-**Rationale**:
-- **Hardware efficiency**: Fixed-point arithmetic is smaller/faster than floating-point in RTL
-- **Sufficient precision**: Q1.15 resolution is 3×10⁻⁵, adequate for ~0.01% weight accuracy
-- **Natural mapping**: Q1.15 directly represents [-1, 1] weight range
-- **Phase range**: Q2.14 covers [0, 2π) with ~0.4 mrad resolution
-
-**Trade-off**: Limited dynamic range compared to floating-point. For weights near zero, relative precision decreases. Acceptable for neural network inference where weights are typically O(1).
-
-#### Why Output-Driven (Not Setpoint-Based) Control?
-
-**Choice**: Controller adjusts phases based on measured output error, not pre-computed phase setpoints
-
-**Alternative**: Characterize MZI transfer function, compute phase setpoints analytically
-
-**Rationale**:
-- **Adapts to hardware variations**: No need for per-device calibration tables
-- **Tracks drift**: Continuous feedback compensates environmental changes
-- **Handles crosstalk**: Multi-variable optimization accounts for phase coupling
-- **Robust to aging**: Re-calibration automatically adjusts to device degradation
-
-**Trade-off**: Requires calibration time before each use (or after disturbance). Setpoint-based control would be faster for static conditions but fails when hardware deviates from model.
-
-### Industry Context
-
-**How production systems handle these trade-offs**:
-
-| Aspect | This Project | Production Systems |
-|--------|--------------|-------------------|
-| Matrix size | 2×2 | 64×64 to 256×256 |
-| Architecture | Single MZI | SVD (Clements/Reck mesh) |
-| Arbitrary matrices | Unitary only | Full via SVD + VOAs |
-| Calibration | Software coordinate descent | Hardware-accelerated or hybrid |
-| Detection | Coherent | Often coherent with balanced detection |
-| Control bandwidth | ~kHz (demo) | ~MHz (production) |
-
-**Key insight**: This project demonstrates the fundamental principles. Scaling to production requires:
-1. Larger MZI meshes with SVD decomposition
-2. Hardware-accelerated calibration loops
-3. Higher-bandwidth thermal control
-4. Manufacturing process optimization for lower crosstalk
+- **SVD in software**: Matrix decomposition requires floating-point; doing it off-chip keeps RTL simple
+- **Calibration in hardware**: Real-time feedback loop needs low latency; RTL handles coordinate descent
+- **σ passed as DAC codes**: Avoids floating-point in RTL; software pre-computes the mapping
 
 ## License
 
-MIT License - see [LICENSE](LICENSE)
+MIT
