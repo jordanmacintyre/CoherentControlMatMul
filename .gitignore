@@ -208,8 +208,7 @@ __marimo__/
 
 # Simulation artifacts
 sim/obj_dir/
-sim/results/*.vcd
-sim/results/*.json
+sim/results/
 *.vcd
 *.fst
 
