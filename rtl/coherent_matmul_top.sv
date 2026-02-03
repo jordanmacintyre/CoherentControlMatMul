@@ -107,9 +107,13 @@ module coherent_matmul_top
     logic [3:0]  lock_counter;
     logic [1:0]  phase_index;  // Which phase we're optimizing (0-3 for each mesh)
 
-    // Sample accumulators
-    logic signed [DATA_WIDTH_P+3:0] i0_accum, q0_accum;
-    logic signed [DATA_WIDTH_P+3:0] i1_accum, q1_accum;
+    // Sample accumulators (15-bit signed: 8 samples × 12-bit ADC)
+    logic signed [ADC_WIDTH_P+3:0] i0_accum, q0_accum;
+    logic signed [ADC_WIDTH_P+3:0] i1_accum, q1_accum;
+
+    // Scaled Q1.15 outputs from ADC accumulators
+    logic signed [DATA_WIDTH_P-1:0] i0_scaled, q0_scaled;
+    logic signed [DATA_WIDTH_P-1:0] i1_scaled, q1_scaled;
 
     // Control flags
     logic weights_valid;
@@ -118,6 +122,62 @@ module coherent_matmul_top
 
     // Mode latch (captured at calibration start)
     logic svd_mode_latched;
+
+    //-------------------------------------------------------------------------
+    // Momentum-based optimization state
+    // Velocity accumulators for each phase - enables gradient descent with momentum
+    // Update rule: v = β*v + step_contribution, then φ += v
+    //-------------------------------------------------------------------------
+    logic signed [PHASE_WIDTH_P-1:0] phi_velocity [NUM_PHASES_P];
+    logic signed [PHASE_WIDTH_P-1:0] phi_velocity_v [NUM_PHASES_V];
+    logic signed [PHASE_WIDTH_P-1:0] phi_velocity_u [NUM_PHASES_U];
+
+    //-------------------------------------------------------------------------
+    // ADC to Q1.15 Scalers
+    //
+    // Interface contract: ADC full-scale (±2047) = ±1.0 optical amplitude
+    // Scaling: (accumulated / 8) * 16 = accumulated * 2 = accumulated << 1
+    // This converts 8-sample ADC accumulation to Q1.15 fixed-point
+    //-------------------------------------------------------------------------
+    adc_scaler #(
+        .ADC_WIDTH(ADC_WIDTH_P),
+        .ACC_SAMPLES(CAL_AVG_SAMPLES),
+        .Q15_WIDTH(DATA_WIDTH_P),
+        .SCALE_SHIFT(1)
+    ) scaler_i0 (
+        .accumulator(i0_accum),
+        .q15_out(i0_scaled)
+    );
+
+    adc_scaler #(
+        .ADC_WIDTH(ADC_WIDTH_P),
+        .ACC_SAMPLES(CAL_AVG_SAMPLES),
+        .Q15_WIDTH(DATA_WIDTH_P),
+        .SCALE_SHIFT(1)
+    ) scaler_q0 (
+        .accumulator(q0_accum),
+        .q15_out(q0_scaled)
+    );
+
+    adc_scaler #(
+        .ADC_WIDTH(ADC_WIDTH_P),
+        .ACC_SAMPLES(CAL_AVG_SAMPLES),
+        .Q15_WIDTH(DATA_WIDTH_P),
+        .SCALE_SHIFT(1)
+    ) scaler_i1 (
+        .accumulator(i1_accum),
+        .q15_out(i1_scaled)
+    );
+
+    adc_scaler #(
+        .ADC_WIDTH(ADC_WIDTH_P),
+        .ACC_SAMPLES(CAL_AVG_SAMPLES),
+        .Q15_WIDTH(DATA_WIDTH_P),
+        .SCALE_SHIFT(1)
+    ) scaler_q1 (
+        .accumulator(q1_accum),
+        .q15_out(q1_scaled)
+    );
 
     //-------------------------------------------------------------------------
     // Input weight validation
@@ -482,6 +542,16 @@ module coherent_matmul_top
                 m_hat_real[i] <= '0;
                 m_hat_imag[i] <= '0;
             end
+            // Reset velocity registers for momentum optimization
+            for (int i = 0; i < NUM_PHASES_P; i++) begin
+                phi_velocity[i] <= '0;
+            end
+            for (int i = 0; i < NUM_PHASES_V; i++) begin
+                phi_velocity_v[i] <= '0;
+            end
+            for (int i = 0; i < NUM_PHASES_U; i++) begin
+                phi_velocity_u[i] <= '0;
+            end
             status <= '0;
 
         end else begin
@@ -496,6 +566,10 @@ module coherent_matmul_top
                     lock_counter <= '0;
                     phi_step <= PHASE_STEP_INITIAL;
                     error_best <= '1;
+                    // Reset velocity registers for new calibration
+                    for (int i = 0; i < NUM_PHASES_P; i++) begin
+                        phi_velocity[i] <= '0;
+                    end
                 end
 
                 CAL_VALIDATE: begin
@@ -527,11 +601,11 @@ module coherent_matmul_top
 
                     // Store averaged measurements as column 0 of M_hat
                     if (sample_counter >= CAL_AVG_SAMPLES) begin
-                        // Scale accumulator to Q1.15 (divide by samples, scale by gain)
-                        m_hat_real[0] <= i0_accum[DATA_WIDTH_P+2:3];  // M00_real
-                        m_hat_imag[0] <= q0_accum[DATA_WIDTH_P+2:3];  // M00_imag
-                        m_hat_real[2] <= i1_accum[DATA_WIDTH_P+2:3];  // M10_real
-                        m_hat_imag[2] <= q1_accum[DATA_WIDTH_P+2:3];  // M10_imag
+                        // Use adc_scaler output for proper ADC→Q1.15 conversion
+                        m_hat_real[0] <= i0_scaled;  // M00_real
+                        m_hat_imag[0] <= q0_scaled;  // M00_imag
+                        m_hat_real[2] <= i1_scaled;  // M10_real
+                        m_hat_imag[2] <= q1_scaled;  // M10_imag
                     end
                 end
 
@@ -546,32 +620,55 @@ module coherent_matmul_top
 
                     // Store averaged measurements as column 1 of M_hat
                     if (sample_counter >= CAL_AVG_SAMPLES) begin
-                        m_hat_real[1] <= i0_accum[DATA_WIDTH_P+2:3];  // M01_real
-                        m_hat_imag[1] <= q0_accum[DATA_WIDTH_P+2:3];  // M01_imag
-                        m_hat_real[3] <= i1_accum[DATA_WIDTH_P+2:3];  // M11_real
-                        m_hat_imag[3] <= q1_accum[DATA_WIDTH_P+2:3];  // M11_imag
+                        // Use adc_scaler output for proper ADC→Q1.15 conversion
+                        m_hat_real[1] <= i0_scaled;  // M01_real
+                        m_hat_imag[1] <= q0_scaled;  // M01_imag
+                        m_hat_real[3] <= i1_scaled;  // M11_real
+                        m_hat_imag[3] <= q1_scaled;  // M11_imag
                     end
                 end
 
                 CAL_COMPUTE_ERROR: begin
-                    // Compute error = sum of squared differences
-                    // Simplified: just compare real parts to target weights
-                    // Full implementation would include imaginary error term
-                    error_current <= compute_error(m_hat_real, {w0, w1, w2, w3});
+                    // Compute error = sum of squared differences (real + imaginary)
+                    // Includes imaginary error to penalize phase rotation
+                    error_current <= compute_error(m_hat_real, m_hat_imag, {w0, w1, w2, w3});
                     phase_index <= '0;
                     settle_counter <= '0;
                     sample_counter <= '0;
                 end
 
                 CAL_PROBE_PLUS: begin
-                    // Apply phi + delta and measure
+                    // Apply phi + delta and measure column 0
                     settle_counter <= settle_counter + 1'b1;
                     if (settle_counter == 0) begin
                         phi_reg[phase_index] <= phi_reg[phase_index] + phi_step;
+                        // Reset accumulators for new measurement
+                        sample_counter <= '0;
+                        i0_accum <= '0;
+                        q0_accum <= '0;
+                        i1_accum <= '0;
+                        q1_accum <= '0;
                     end
-                    // Store error after settling and sampling
+                    // ADC sampling after settle period
+                    if (settle_counter >= CAL_SETTLE_CYCLES && adc_valid) begin
+                        sample_counter <= sample_counter + 1'b1;
+                        i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                        q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                        i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                        q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                    end
+                    // Compute partial error (column 0 only) after settling and sampling
                     if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES) begin
-                        error_probe_plus <= error_current;
+                        // Use column 0 measurements for partial error: compare M[0,0] vs w0, M[1,0] vs w2
+                        // Keep column 1 from previous full measurement
+                        // Use adc_scaler output for proper ADC→Q1.15 conversion
+                        error_probe_plus <= compute_error(
+                            '{i0_scaled, m_hat_real[1],
+                              i1_scaled, m_hat_real[3]},
+                            '{q0_scaled, m_hat_imag[1],
+                              q1_scaled, m_hat_imag[3]},
+                            {w0, w1, w2, w3}
+                        );
                         // Restore original phase for minus probe
                         phi_reg[phase_index] <= phi_reg[phase_index] - phi_step;
                         settle_counter <= '0;
@@ -580,44 +677,103 @@ module coherent_matmul_top
                 end
 
                 CAL_PROBE_MINUS: begin
-                    // Apply phi - delta and measure
+                    // Apply phi - delta and measure column 0
                     settle_counter <= settle_counter + 1'b1;
                     if (settle_counter == 0) begin
                         phi_reg[phase_index] <= phi_reg[phase_index] - phi_step;
+                        // Reset accumulators for new measurement
+                        sample_counter <= '0;
+                        i0_accum <= '0;
+                        q0_accum <= '0;
+                        i1_accum <= '0;
+                        q1_accum <= '0;
                     end
-                    // Store error after settling and sampling
+                    // ADC sampling after settle period
+                    if (settle_counter >= CAL_SETTLE_CYCLES && adc_valid) begin
+                        sample_counter <= sample_counter + 1'b1;
+                        i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                        q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                        i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                        q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                    end
+                    // Compute partial error (column 0 only) after settling and sampling
                     if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES) begin
-                        error_probe_minus <= error_current;
+                        // Use column 0 measurements for partial error
+                        // Use adc_scaler output for proper ADC→Q1.15 conversion
+                        error_probe_minus <= compute_error(
+                            '{i0_scaled, m_hat_real[1],
+                              i1_scaled, m_hat_real[3]},
+                            '{q0_scaled, m_hat_imag[1],
+                              q1_scaled, m_hat_imag[3]},
+                            {w0, w1, w2, w3}
+                        );
                     end
                 end
 
                 CAL_UPDATE_PHASE: begin
-                    // Choose best direction and update phase
-                    if (error_probe_plus < error_probe_minus && error_probe_plus < error_best) begin
-                        // Plus direction is better
-                        phi_reg[phase_index] <= phi_reg[phase_index] + phi_step + phi_step;
-                        error_best <= error_probe_plus;
-                    end else if (error_probe_minus < error_best) begin
-                        // Minus direction is better (already at phi - delta)
-                        error_best <= error_probe_minus;
+                    // Momentum-based gradient descent with direction reversal detection
+                    // Gradient sign: if error_probe_plus > error_probe_minus, move negative
+                    // Velocity update: v = β*v + step_contribution (β ≈ 0.3125)
+                    // Key improvement: Reset velocity on direction change to prevent overshoot
+
+                    // Compute velocity decay: v_decay = (v >> 2) + (v >> 4) ≈ 0.3125 * v
+                    automatic logic signed [PHASE_WIDTH_P-1:0] v_decayed;
+                    automatic logic signed [PHASE_WIDTH_P-1:0] v_new;  // New velocity computed combinationally
+                    automatic logic gradient_positive;  // True if should move positive
+                    automatic logic velocity_positive;  // True if velocity is positive
+
+                    v_decayed = (phi_velocity[phase_index] >>> MOMENTUM_DECAY_SHIFT1) +
+                                (phi_velocity[phase_index] >>> MOMENTUM_DECAY_SHIFT2);
+
+                    gradient_positive = (error_probe_plus < error_probe_minus);
+                    velocity_positive = !phi_velocity[phase_index][PHASE_WIDTH_P-1];
+
+                    // Compute new velocity combinationally so it can be used immediately
+                    // Check for direction reversal (gradient and velocity have opposite signs)
+                    // If reversing direction, reset velocity to prevent overshoot
+                    if (gradient_positive != velocity_positive && phi_velocity[phase_index] != '0) begin
+                        // Direction reversal - reset velocity and use step only
+                        v_new = gradient_positive ? $signed(phi_step) : -$signed(phi_step);
                     end else begin
-                        // No improvement, restore original
-                        phi_reg[phase_index] <= phi_reg[phase_index] + phi_step;
+                        // Same direction - apply momentum
+                        v_new = gradient_positive ? (v_decayed + $signed(phi_step))
+                                                  : (v_decayed - $signed(phi_step));
                     end
+
+                    // Store new velocity for next iteration
+                    phi_velocity[phase_index] <= v_new;
+
+                    // Update best error
+                    if (error_probe_plus < error_probe_minus) begin
+                        if (error_probe_plus < error_best)
+                            error_best <= error_probe_plus;
+                    end else begin
+                        if (error_probe_minus < error_best)
+                            error_best <= error_probe_minus;
+                    end
+
+                    // Apply velocity to phase (restore to original then add velocity)
+                    // Current position is at phi - delta (from probe_minus)
+                    // Restore to original: +delta, then apply NEW velocity (not old!)
+                    phi_reg[phase_index] <= phi_reg[phase_index] + phi_step + v_new;
+
                     iteration_counter <= iteration_counter + 1'b1;
                 end
 
                 CAL_CHECK_CONVERGE: begin
-                    // Check if error is below threshold
+                    // Check if error is below threshold with hysteresis
+                    // Lock when below CAL_LOCK_THRESHOLD, only reset if above CAL_UNLOCK_THRESHOLD
                     if (error_best < CAL_LOCK_THRESHOLD) begin
                         lock_counter <= lock_counter + 1'b1;
-                    end else begin
+                    end else if (error_best > CAL_UNLOCK_THRESHOLD) begin
+                        // Only reset if significantly above threshold (hysteresis prevents oscillation)
                         lock_counter <= '0;
-                        // Reduce step size when not converging
-                        if (iteration_counter[4:0] == '0 && phi_step > PHASE_STEP_MIN) begin
+                        // Reduce step size when not converging (every 64 iterations instead of 32)
+                        if (iteration_counter[5:0] == '0 && phi_step > PHASE_STEP_MIN) begin
                             phi_step <= phi_step >> PHASE_STEP_DECAY;
                         end
                     end
+                    // If between thresholds, maintain lock_counter progress (no reset)
 
                     // Move to next phase
                     phase_index <= phase_index + 1'b1;
@@ -654,6 +810,13 @@ module coherent_matmul_top
                         phi_step <= PHASE_STEP_INITIAL;
                         error_best <= '1;
                         svd_component <= SVD_COMP_V;
+                        // Reset velocity registers for new calibration
+                        for (int i = 0; i < NUM_PHASES_V; i++) begin
+                            phi_velocity_v[i] <= '0;
+                        end
+                        for (int i = 0; i < NUM_PHASES_U; i++) begin
+                            phi_velocity_u[i] <= '0;
+                        end
                     end
 
                     SVD_CAL_VALIDATE: begin
@@ -685,10 +848,11 @@ module coherent_matmul_top
                             q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
                         end
                         if (sample_counter >= CAL_AVG_SAMPLES) begin
-                            m_hat_real[0] <= i0_accum[DATA_WIDTH_P+2:3];
-                            m_hat_imag[0] <= q0_accum[DATA_WIDTH_P+2:3];
-                            m_hat_real[2] <= i1_accum[DATA_WIDTH_P+2:3];
-                            m_hat_imag[2] <= q1_accum[DATA_WIDTH_P+2:3];
+                            // Use adc_scaler output for proper ADC→Q1.15 conversion
+                            m_hat_real[0] <= i0_scaled;
+                            m_hat_imag[0] <= q0_scaled;
+                            m_hat_real[2] <= i1_scaled;
+                            m_hat_imag[2] <= q1_scaled;
                         end
                     end
 
@@ -701,15 +865,16 @@ module coherent_matmul_top
                             q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
                         end
                         if (sample_counter >= CAL_AVG_SAMPLES) begin
-                            m_hat_real[1] <= i0_accum[DATA_WIDTH_P+2:3];
-                            m_hat_imag[1] <= q0_accum[DATA_WIDTH_P+2:3];
-                            m_hat_real[3] <= i1_accum[DATA_WIDTH_P+2:3];
-                            m_hat_imag[3] <= q1_accum[DATA_WIDTH_P+2:3];
+                            // Use adc_scaler output for proper ADC→Q1.15 conversion
+                            m_hat_real[1] <= i0_scaled;
+                            m_hat_imag[1] <= q0_scaled;
+                            m_hat_real[3] <= i1_scaled;
+                            m_hat_imag[3] <= q1_scaled;
                         end
                     end
 
                     SVD_CAL_COMPUTE_ERR_V: begin
-                        error_current <= compute_error(m_hat_real, {w0, w1, w2, w3});
+                        error_current <= compute_error(m_hat_real, m_hat_imag, {w0, w1, w2, w3});
                         phase_index <= '0;
                         settle_counter <= '0;
                         sample_counter <= '0;
@@ -717,10 +882,33 @@ module coherent_matmul_top
 
                     SVD_CAL_PROBE_PLUS_V: begin
                         settle_counter <= settle_counter + 1'b1;
-                        if (settle_counter == 0)
+                        if (settle_counter == 0) begin
                             phi_reg_v[phase_index] <= phi_reg_v[phase_index] + phi_step;
+                            // Reset accumulators for new measurement
+                            sample_counter <= '0;
+                            i0_accum <= '0;
+                            q0_accum <= '0;
+                            i1_accum <= '0;
+                            q1_accum <= '0;
+                        end
+                        // ADC sampling after settle period
+                        if (settle_counter >= CAL_SETTLE_CYCLES && adc_valid) begin
+                            sample_counter <= sample_counter + 1'b1;
+                            i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                            q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                            i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                            q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                        end
                         if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES) begin
-                            error_probe_plus <= error_current;
+                            // Use column 0 measurements for partial error
+                            // Use adc_scaler output for proper ADC→Q1.15 conversion
+                            error_probe_plus <= compute_error(
+                                '{i0_scaled, m_hat_real[1],
+                                  i1_scaled, m_hat_real[3]},
+                                '{q0_scaled, m_hat_imag[1],
+                                  q1_scaled, m_hat_imag[3]},
+                                {w0, w1, w2, w3}
+                            );
                             phi_reg_v[phase_index] <= phi_reg_v[phase_index] - phi_step;
                             settle_counter <= '0;
                             sample_counter <= '0;
@@ -729,36 +917,90 @@ module coherent_matmul_top
 
                     SVD_CAL_PROBE_MINUS_V: begin
                         settle_counter <= settle_counter + 1'b1;
-                        if (settle_counter == 0)
+                        if (settle_counter == 0) begin
                             phi_reg_v[phase_index] <= phi_reg_v[phase_index] - phi_step;
-                        if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES)
-                            error_probe_minus <= error_current;
+                            // Reset accumulators for new measurement
+                            sample_counter <= '0;
+                            i0_accum <= '0;
+                            q0_accum <= '0;
+                            i1_accum <= '0;
+                            q1_accum <= '0;
+                        end
+                        // ADC sampling after settle period
+                        if (settle_counter >= CAL_SETTLE_CYCLES && adc_valid) begin
+                            sample_counter <= sample_counter + 1'b1;
+                            i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                            q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                            i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                            q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                        end
+                        if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES) begin
+                            // Use column 0 measurements for partial error
+                            // Use adc_scaler output for proper ADC→Q1.15 conversion
+                            error_probe_minus <= compute_error(
+                                '{i0_scaled, m_hat_real[1],
+                                  i1_scaled, m_hat_real[3]},
+                                '{q0_scaled, m_hat_imag[1],
+                                  q1_scaled, m_hat_imag[3]},
+                                {w0, w1, w2, w3}
+                            );
+                        end
                     end
 
                     SVD_CAL_UPDATE_V: begin
-                        if (error_probe_plus < error_probe_minus && error_probe_plus < error_best) begin
-                            phi_reg_v[phase_index] <= phi_reg_v[phase_index] + phi_step + phi_step;
-                            error_best <= error_probe_plus;
-                        end else if (error_probe_minus < error_best) begin
-                            error_best <= error_probe_minus;
+                        // Momentum-based gradient descent for V† mesh with direction reversal detection
+                        automatic logic signed [PHASE_WIDTH_P-1:0] v_decayed;
+                        automatic logic signed [PHASE_WIDTH_P-1:0] v_new;  // New velocity computed combinationally
+                        automatic logic gradient_positive;
+                        automatic logic velocity_positive;
+
+                        v_decayed = (phi_velocity_v[phase_index] >>> MOMENTUM_DECAY_SHIFT1) +
+                                    (phi_velocity_v[phase_index] >>> MOMENTUM_DECAY_SHIFT2);
+
+                        gradient_positive = (error_probe_plus < error_probe_minus);
+                        velocity_positive = !phi_velocity_v[phase_index][PHASE_WIDTH_P-1];
+
+                        // Compute new velocity combinationally so it can be used immediately
+                        // Reset velocity on direction reversal to prevent overshoot
+                        if (gradient_positive != velocity_positive && phi_velocity_v[phase_index] != '0) begin
+                            v_new = gradient_positive ? $signed(phi_step) : -$signed(phi_step);
                         end else begin
-                            phi_reg_v[phase_index] <= phi_reg_v[phase_index] + phi_step;
+                            v_new = gradient_positive ? (v_decayed + $signed(phi_step))
+                                                      : (v_decayed - $signed(phi_step));
                         end
+
+                        // Store new velocity for next iteration
+                        phi_velocity_v[phase_index] <= v_new;
+
+                        // Update best error
+                        if (error_probe_plus < error_probe_minus) begin
+                            if (error_probe_plus < error_best)
+                                error_best <= error_probe_plus;
+                        end else begin
+                            if (error_probe_minus < error_best)
+                                error_best <= error_probe_minus;
+                        end
+
+                        // Apply NEW velocity to phase (not old!)
+                        phi_reg_v[phase_index] <= phi_reg_v[phase_index] + phi_step + v_new;
                         iteration_counter <= iteration_counter + 1'b1;
                     end
 
                     SVD_CAL_CHECK_V: begin
+                        // Check if error is below threshold with hysteresis
                         if (error_best < CAL_LOCK_THRESHOLD) begin
                             lock_counter <= lock_counter + 1'b1;
                             if (lock_counter >= CAL_LOCK_COUNT - 1) begin
                                 v_locked_reg <= 1'b1;
                                 status.v_locked <= 1'b1;
                             end
-                        end else begin
+                        end else if (error_best > CAL_UNLOCK_THRESHOLD) begin
+                            // Only reset if significantly above threshold (hysteresis)
                             lock_counter <= '0;
-                            if (iteration_counter[4:0] == '0 && phi_step > PHASE_STEP_MIN)
+                            if (iteration_counter[5:0] == '0 && phi_step > PHASE_STEP_MIN)
                                 phi_step <= phi_step >> PHASE_STEP_DECAY;
                         end
+                        // If between thresholds, maintain lock_counter progress
                         phase_index <= phase_index + 1'b1;
                     end
 
@@ -797,10 +1039,11 @@ module coherent_matmul_top
                             q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
                         end
                         if (sample_counter >= CAL_AVG_SAMPLES) begin
-                            m_hat_real[0] <= i0_accum[DATA_WIDTH_P+2:3];
-                            m_hat_imag[0] <= q0_accum[DATA_WIDTH_P+2:3];
-                            m_hat_real[2] <= i1_accum[DATA_WIDTH_P+2:3];
-                            m_hat_imag[2] <= q1_accum[DATA_WIDTH_P+2:3];
+                            // Use adc_scaler output for proper ADC→Q1.15 conversion
+                            m_hat_real[0] <= i0_scaled;
+                            m_hat_imag[0] <= q0_scaled;
+                            m_hat_real[2] <= i1_scaled;
+                            m_hat_imag[2] <= q1_scaled;
                         end
                     end
 
@@ -813,15 +1056,16 @@ module coherent_matmul_top
                             q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
                         end
                         if (sample_counter >= CAL_AVG_SAMPLES) begin
-                            m_hat_real[1] <= i0_accum[DATA_WIDTH_P+2:3];
-                            m_hat_imag[1] <= q0_accum[DATA_WIDTH_P+2:3];
-                            m_hat_real[3] <= i1_accum[DATA_WIDTH_P+2:3];
-                            m_hat_imag[3] <= q1_accum[DATA_WIDTH_P+2:3];
+                            // Use adc_scaler output for proper ADC→Q1.15 conversion
+                            m_hat_real[1] <= i0_scaled;
+                            m_hat_imag[1] <= q0_scaled;
+                            m_hat_real[3] <= i1_scaled;
+                            m_hat_imag[3] <= q1_scaled;
                         end
                     end
 
                     SVD_CAL_COMPUTE_ERR_U: begin
-                        error_current <= compute_error(m_hat_real, {w0, w1, w2, w3});
+                        error_current <= compute_error(m_hat_real, m_hat_imag, {w0, w1, w2, w3});
                         phase_index <= '0;
                         settle_counter <= '0;
                         sample_counter <= '0;
@@ -829,10 +1073,33 @@ module coherent_matmul_top
 
                     SVD_CAL_PROBE_PLUS_U: begin
                         settle_counter <= settle_counter + 1'b1;
-                        if (settle_counter == 0)
+                        if (settle_counter == 0) begin
                             phi_reg_u[phase_index] <= phi_reg_u[phase_index] + phi_step;
+                            // Reset accumulators for new measurement
+                            sample_counter <= '0;
+                            i0_accum <= '0;
+                            q0_accum <= '0;
+                            i1_accum <= '0;
+                            q1_accum <= '0;
+                        end
+                        // ADC sampling after settle period
+                        if (settle_counter >= CAL_SETTLE_CYCLES && adc_valid) begin
+                            sample_counter <= sample_counter + 1'b1;
+                            i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                            q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                            i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                            q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                        end
                         if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES) begin
-                            error_probe_plus <= error_current;
+                            // Use column 0 measurements for partial error
+                            // Use adc_scaler output for proper ADC→Q1.15 conversion
+                            error_probe_plus <= compute_error(
+                                '{i0_scaled, m_hat_real[1],
+                                  i1_scaled, m_hat_real[3]},
+                                '{q0_scaled, m_hat_imag[1],
+                                  q1_scaled, m_hat_imag[3]},
+                                {w0, w1, w2, w3}
+                            );
                             phi_reg_u[phase_index] <= phi_reg_u[phase_index] - phi_step;
                             settle_counter <= '0;
                             sample_counter <= '0;
@@ -841,36 +1108,90 @@ module coherent_matmul_top
 
                     SVD_CAL_PROBE_MINUS_U: begin
                         settle_counter <= settle_counter + 1'b1;
-                        if (settle_counter == 0)
+                        if (settle_counter == 0) begin
                             phi_reg_u[phase_index] <= phi_reg_u[phase_index] - phi_step;
-                        if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES)
-                            error_probe_minus <= error_current;
+                            // Reset accumulators for new measurement
+                            sample_counter <= '0;
+                            i0_accum <= '0;
+                            q0_accum <= '0;
+                            i1_accum <= '0;
+                            q1_accum <= '0;
+                        end
+                        // ADC sampling after settle period
+                        if (settle_counter >= CAL_SETTLE_CYCLES && adc_valid) begin
+                            sample_counter <= sample_counter + 1'b1;
+                            i0_accum <= i0_accum + {{4{adc_i0[ADC_WIDTH_P-1]}}, adc_i0};
+                            q0_accum <= q0_accum + {{4{adc_q0[ADC_WIDTH_P-1]}}, adc_q0};
+                            i1_accum <= i1_accum + {{4{adc_i1[ADC_WIDTH_P-1]}}, adc_i1};
+                            q1_accum <= q1_accum + {{4{adc_q1[ADC_WIDTH_P-1]}}, adc_q1};
+                        end
+                        if (settle_counter >= CAL_SETTLE_CYCLES && sample_counter >= CAL_AVG_SAMPLES) begin
+                            // Use column 0 measurements for partial error
+                            // Use adc_scaler output for proper ADC→Q1.15 conversion
+                            error_probe_minus <= compute_error(
+                                '{i0_scaled, m_hat_real[1],
+                                  i1_scaled, m_hat_real[3]},
+                                '{q0_scaled, m_hat_imag[1],
+                                  q1_scaled, m_hat_imag[3]},
+                                {w0, w1, w2, w3}
+                            );
+                        end
                     end
 
                     SVD_CAL_UPDATE_U: begin
-                        if (error_probe_plus < error_probe_minus && error_probe_plus < error_best) begin
-                            phi_reg_u[phase_index] <= phi_reg_u[phase_index] + phi_step + phi_step;
-                            error_best <= error_probe_plus;
-                        end else if (error_probe_minus < error_best) begin
-                            error_best <= error_probe_minus;
+                        // Momentum-based gradient descent for U mesh with direction reversal detection
+                        automatic logic signed [PHASE_WIDTH_P-1:0] v_decayed;
+                        automatic logic signed [PHASE_WIDTH_P-1:0] v_new;  // New velocity computed combinationally
+                        automatic logic gradient_positive;
+                        automatic logic velocity_positive;
+
+                        v_decayed = (phi_velocity_u[phase_index] >>> MOMENTUM_DECAY_SHIFT1) +
+                                    (phi_velocity_u[phase_index] >>> MOMENTUM_DECAY_SHIFT2);
+
+                        gradient_positive = (error_probe_plus < error_probe_minus);
+                        velocity_positive = !phi_velocity_u[phase_index][PHASE_WIDTH_P-1];
+
+                        // Compute new velocity combinationally so it can be used immediately
+                        // Reset velocity on direction reversal to prevent overshoot
+                        if (gradient_positive != velocity_positive && phi_velocity_u[phase_index] != '0) begin
+                            v_new = gradient_positive ? $signed(phi_step) : -$signed(phi_step);
                         end else begin
-                            phi_reg_u[phase_index] <= phi_reg_u[phase_index] + phi_step;
+                            v_new = gradient_positive ? (v_decayed + $signed(phi_step))
+                                                      : (v_decayed - $signed(phi_step));
                         end
+
+                        // Store new velocity for next iteration
+                        phi_velocity_u[phase_index] <= v_new;
+
+                        // Update best error
+                        if (error_probe_plus < error_probe_minus) begin
+                            if (error_probe_plus < error_best)
+                                error_best <= error_probe_plus;
+                        end else begin
+                            if (error_probe_minus < error_best)
+                                error_best <= error_probe_minus;
+                        end
+
+                        // Apply NEW velocity to phase (not old!)
+                        phi_reg_u[phase_index] <= phi_reg_u[phase_index] + phi_step + v_new;
                         iteration_counter <= iteration_counter + 1'b1;
                     end
 
                     SVD_CAL_CHECK_U: begin
+                        // Check if error is below threshold with hysteresis
                         if (error_best < CAL_LOCK_THRESHOLD) begin
                             lock_counter <= lock_counter + 1'b1;
                             if (lock_counter >= CAL_LOCK_COUNT - 1) begin
                                 u_locked_reg <= 1'b1;
                                 status.u_locked <= 1'b1;
                             end
-                        end else begin
+                        end else if (error_best > CAL_UNLOCK_THRESHOLD) begin
+                            // Only reset if significantly above threshold (hysteresis)
                             lock_counter <= '0;
-                            if (iteration_counter[4:0] == '0 && phi_step > PHASE_STEP_MIN)
+                            if (iteration_counter[5:0] == '0 && phi_step > PHASE_STEP_MIN)
                                 phi_step <= phi_step >> PHASE_STEP_DECAY;
                         end
+                        // If between thresholds, maintain lock_counter progress
                         phase_index <= phase_index + 1'b1;
                     end
 
@@ -893,17 +1214,22 @@ module coherent_matmul_top
 
     //-------------------------------------------------------------------------
     // Error computation function
+    // Includes both real and imaginary parts for proper complex optimization.
+    // For real target matrices, imaginary error penalizes phase rotation.
     //-------------------------------------------------------------------------
     function automatic logic [ACC_WIDTH-1:0] compute_error(
         input logic signed [DATA_WIDTH_P-1:0] m_real [4],
+        input logic signed [DATA_WIDTH_P-1:0] m_imag [4],
         input logic signed [DATA_WIDTH_P-1:0] w [4]
     );
-        logic signed [DATA_WIDTH_P:0] diff [4];
+        logic signed [DATA_WIDTH_P:0] diff_real [4];
+        logic signed [DATA_WIDTH_P:0] diff_imag [4];
         logic [ACC_WIDTH-1:0] sum;
         sum = '0;
         for (int i = 0; i < 4; i++) begin
-            diff[i] = m_real[i] - w[i];
-            sum = sum + (diff[i] * diff[i]);
+            diff_real[i] = m_real[i] - w[i];
+            diff_imag[i] = m_imag[i];  // Target imag = 0 for real matrices
+            sum = sum + (diff_real[i] * diff_real[i]) + (diff_imag[i] * diff_imag[i]);
         end
         return sum;
     endfunction
@@ -927,7 +1253,10 @@ module coherent_matmul_top
                     // SVD mode: drive basis vectors based on SVD FSM state
                     case (svd_cal_state)
                         SVD_CAL_APPLY_BASIS0_V, SVD_CAL_SETTLE0_V, SVD_CAL_SAMPLE_COL0_V,
-                        SVD_CAL_APPLY_BASIS0_U, SVD_CAL_SETTLE0_U, SVD_CAL_SAMPLE_COL0_U: begin
+                        SVD_CAL_APPLY_BASIS0_U, SVD_CAL_SETTLE0_U, SVD_CAL_SAMPLE_COL0_U,
+                        SVD_CAL_PROBE_PLUS_V, SVD_CAL_PROBE_MINUS_V,
+                        SVD_CAL_PROBE_PLUS_U, SVD_CAL_PROBE_MINUS_U: begin
+                            // Drive basis0 [1,0] for column 0 measurements and PROBE states
                             x_drive0 = Q1_15_ONE;
                             x_drive1 = '0;
                         end
@@ -944,7 +1273,9 @@ module coherent_matmul_top
                 end else begin
                     // Unitary mode: drive basis vectors for calibration
                     case (cal_state)
-                        CAL_APPLY_BASIS0, CAL_SETTLE0, CAL_SAMPLE_COL0: begin
+                        CAL_APPLY_BASIS0, CAL_SETTLE0, CAL_SAMPLE_COL0,
+                        CAL_PROBE_PLUS, CAL_PROBE_MINUS: begin
+                            // Drive basis0 [1,0] for column 0 measurements and PROBE states
                             x_drive0 = Q1_15_ONE;  // 1.0
                             x_drive1 = '0;          // 0.0
                         end

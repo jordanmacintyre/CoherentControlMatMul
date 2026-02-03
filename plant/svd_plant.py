@@ -47,7 +47,7 @@ class SVDPhotonicPlant:
         drift_rate: float = 0.001,
         crosstalk_coeff: float = 0.05,
         # Receiver parameters
-        receiver_gain: float = 1000.0,
+        receiver_gain: float = 2047.0,  # Fills ADC range: 1.0 optical → 2047 LSB
         noise_std: float = 5.0,
         adc_bits: int = 12,
         # DAC parameters

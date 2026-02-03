@@ -220,3 +220,4 @@ Vtop*
 # cocotb artifacts
 results.xml
 sim_build/
+artifacts/

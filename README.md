@@ -1,6 +1,6 @@
 # Coherent Photonic Matrix Multiply
 
-Closed-loop coherent photonic 2×2 matrix multiplication with output-driven phase control.
+Mixed-signal co-simulation of a closed-loop coherent photonic 2×2 matrix multiplier. RTL calibration controller + Python photonic plant models via cocotb.
 
 ## What This Does
 
@@ -8,33 +8,88 @@ This system implements **hardware-in-the-loop calibration** for a photonic matri
 
 ```
 User provides: Target matrix M = [[w₀, w₁], [w₂, w₃]]
-System does:   Adjusts optical phases until photonic output matches M·x
-Result:        Hardware computes y = M·x at the speed of light
+RTL does:      Coordinate descent to find phases via I/Q feedback
+Plant model:   Python photonic simulation (MZI, thermal, noise)
+Result:        Verified RTL that computes y = M·x
 ```
 
-The key insight is that **users specify what they want (matrix weights), not how to get it (phase values)**. The calibration loop finds the phases automatically using only I/Q measurements as feedback.
+The key insight is that **users specify what they want (matrix weights), not how to get it (phase values)**. The RTL calibration FSM finds the phases automatically using only I/Q measurements from the Python plant model.
 
 ## Quick Start
 
 ```bash
-# Install
+# Install dependencies
 pip install -e .
+pip install cocotb
+brew install icarus-verilog  # macOS
+# or: apt install iverilog   # Linux
 
-# Run with a Hadamard matrix
+# Check dependencies
+python run.py --check-deps
+
+# Run co-simulation
 python run.py --weights 0.707 0.707 0.707 -0.707 --input 1.0 0.5
 
-# Use SVD mode for non-unitary matrices
-python run.py --svd --weights 0.5 0 0 0.3 --input 1.0 1.0
+# Run all RTL tests
+cd rtl && make test-all
 
-# Save results with plots
-python run.py --weights 1 0 0 1 --input 1.0 0.0 --save-results --verbose
+# View waveforms
+cd rtl && DUMP_WAVES=1 make test-all && make waves
+```
+
+## Architecture
+
+### Mixed-Signal Co-Simulation
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Python (cocotb)                                                │
+│  ┌─────────────────┐      ┌──────────────────────────────────┐  │
+│  │  PlantAdapter   │◄────►│ PhotonicPlant / SVDPhotonicPlant │  │
+│  │  (RTL bridge)   │      │ (thermal, optics, receiver)      │  │
+│  └────────┬────────┘      └──────────────────────────────────┘  │
+│           │                                                     │
+│           │ DAC codes, x_drive ↓   ↑ ADC I/Q, adc_valid         │
+│           │                                                     │
+├───────────┼─────────────────────────────────────────────────────┤
+│  RTL      │                                                     │
+│  ┌────────▼────────────────────────────────────────────────┐    │
+│  │  coherent_matmul_top.sv                                 │    │
+│  │  (calibration FSM, coordinate descent, error compute)   │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Signal Flow
+
+| RTL Output | Direction | Python Plant |
+|------------|-----------|--------------|
+| `phi_dac[4]` | RTL→Plant | Phase DAC codes (unitary) |
+| `phi_dac_v[4]` | RTL→Plant | V† mesh phases (SVD) |
+| `voa_dac[2]` | RTL→Plant | Σ VOA codes (SVD) |
+| `phi_dac_u[4]` | RTL→Plant | U mesh phases (SVD) |
+| `x_drive0/1` | RTL→Plant | Input vector (Q1.15) |
+| `adc_i0/q0/i1/q1` | Plant→RTL | I/Q measurements |
+| `adc_valid` | Plant→RTL | Sample valid pulse |
+
+### Optical Architecture
+
+**Standard Mode (Unitary):**
+```
+Input x → [MZI (4 phases)] → Output y = M̂·x
+```
+
+**SVD Mode (Any Matrix):**
+```
+Input x → [MZI V†] → [VOA Σ] → [MZI U] → Output y = U·Σ·V†·x
+         4 phases   2 gains   4 phases
 ```
 
 ## Two Operating Modes
 
 ### Standard Mode (Unitary Matrices)
 
-Single MZI mesh with 4 phase controls. Works for matrices where M†M = I:
+Single MZI mesh with 4 phase controls. Works for matrices where M†M ≈ I:
 
 ```bash
 python run.py --weights 0.707 0.707 0.707 -0.707 --input 1.0 0.5
@@ -47,16 +102,11 @@ Suitable for: Identity, Swap, Hadamard, rotations, permutations.
 Two MZI meshes + variable attenuators. Works for **any** 2×2 matrix:
 
 ```bash
-# Standard SVD (weights in [-1, 1])
 python run.py --svd --weights 0.7 -0.3 0.2 -0.5 --input 1.0 0.5
-
-# Large weights (auto-scaled)
-python run.py --svd --weights 2.0 -1.5 3.0 -2.5 --input 1.0 0.5
+python run.py --svd --weights 2.0 -1.5 3.0 -2.5 --input 1.0 0.5  # auto-scaled
 ```
 
 Uses SVD decomposition: M = U·Σ·V† where U, V† are unitary (MZI meshes) and Σ is diagonal (VOAs).
-
-**Auto-scaling**: When singular values exceed 1.0, the system automatically normalizes the matrix and scales the outputs in software. This enables weights of any magnitude.
 
 ## Command Reference
 
@@ -65,18 +115,92 @@ python run.py [OPTIONS]
 
 Required:
   --weights W0 W1 W2 W3    Target matrix [[W0,W1],[W2,W3]]
-                           Range [-1,1] for unitary mode; any values for --svd
 
 Optional:
   --input X0 X1            Input vector (can specify multiple times)
-  --svd                    Use SVD architecture for arbitrary matrices (auto-scales)
+  --svd                    Use SVD architecture for arbitrary matrices
   --noise N                Receiver noise std dev (default: 2.0)
-  --max-iterations N       Max calibration iterations (default: 300)
-  --error-threshold E      Lock threshold (default: 2e-3)
-  --verbose, -v            Show detailed output
-  --save-results, -s       Save to sim/results/<timestamp>/
   --seed N                 Random seed for reproducibility
+  --verbose, -v            Show detailed output
+  --timeout N              Simulation timeout in seconds (default: 120)
+  --check-deps             Check dependencies and exit
 ```
+
+## RTL Test Suite
+
+```bash
+cd rtl
+
+# Run all tests
+make test-all
+
+# Run specific tests
+make TESTCASE=test_unitary_identity
+make TESTCASE=test_unitary_hadamard
+make TESTCASE=test_svd_diagonal
+make TESTCASE=test_svd_arbitrary
+
+# Shortcuts
+make test-unitary    # All unitary mode tests
+make test-svd        # All SVD mode tests
+
+# With waveforms
+DUMP_WAVES=1 make test-all
+make waves           # Opens GTKWave
+```
+
+### Test Cases
+
+| Test | Mode | Description |
+|------|------|-------------|
+| `test_unitary_identity` | Unitary | Identity matrix calibration |
+| `test_unitary_hadamard` | Unitary | Hadamard (balanced splitter) |
+| `test_unitary_rotation` | Unitary | 30° rotation matrix |
+| `test_svd_diagonal` | SVD | Diagonal scaling [[0.5,0],[0,0.3]] |
+| `test_svd_arbitrary` | SVD | Arbitrary matrix [[0.7,-0.3],[0.2,-0.5]] |
+| `test_convergence_monitoring` | Unitary | Verify error decreases |
+| `test_reset_during_calibration` | Unitary | FSM recovery after reset |
+| `test_mode_switching` | Both | Unitary → SVD transitions |
+| `test_evaluation_after_lock` | Unitary | y = M·x computation |
+
+## Understanding the Output
+
+### Convergence Plots
+
+The convergence plot shows RMS error (%) over calibration cycles:
+
+- **Blue line**: RMS error percentage at each sample point
+- **Green star**: Final calibration point (minimum error achieved)
+- **Red dashed line**: Lock threshold (~1.6% RMS)
+- **Orange/Green horizontal lines**: 5% and 1% accuracy targets
+
+**Why does error go back up?** The optimizer continues searching after finding a good solution. The "Final Cal" marker shows where the best calibration was achieved—this is what gets used.
+
+### Phase Evolution Plots
+
+Shows the 4 phase DAC codes over time:
+
+- **Vertical green line**: Cycle where minimum error occurred
+- **Colored dots**: Final phase values at calibration point
+- **Text box**: "Final Cal Values" showing exact DAC codes
+
+### What Are "Final Cal Values"?
+
+The phase values shown (e.g., `theta: 23842`) are **16-bit DAC codes**, not radians:
+
+| DAC Code | Phase (radians) | Phase (degrees) |
+|----------|-----------------|-----------------|
+| 0 | 0 | 0° |
+| 16384 | π/2 | 90° |
+| 32768 | π | 180° |
+| 49152 | 3π/2 | 270° |
+| 65535 | 2π − ε | ~360° |
+
+**Conversion:** `phase_rad = (dac_code / 65535) × 2π`
+
+Example: `theta: 23842` → (23842/65535) × 2π = **2.29 radians (131°)**
+
+These large numbers are the raw hardware control values. The MZI mesh uses these 4 phases to create the target 2×2 matrix transformation.
 
 ## How It Works
 
@@ -92,49 +216,33 @@ M̂(φ) = [[e^{j(φ₀+φ₁)}cos(θ/2), -e^{jφ₁}sin(θ/2)],
 
 For **real** target matrices, we want M̂_real ≈ M and M̂_imag ≈ 0.
 
-### Calibration Algorithm
+### Calibration Algorithm (RTL)
 
 **Coordinate descent** with adaptive step sizing:
 
 1. Apply basis inputs [1,0] and [0,1]
-2. Measure I/Q outputs via coherent receiver
+2. Measure I/Q outputs via coherent receiver (Python plant)
 3. Compute error: ‖M̂_real - M_target‖² + ‖M̂_imag‖²
 4. For each phase, try ±Δ and keep the direction that reduces error
 5. Decay step size when no improvement
 6. Lock when error stays below threshold for N consecutive iterations
 
-### Why Coordinate Descent?
+### ADC Timing Protocol
 
-- **Noise robust**: Discrete ±Δ probing handles measurement noise better than gradient estimation
-- **No derivatives**: Avoids numerical differentiation issues
-- **Hardware-friendly**: Simple comparisons, easy to implement in RTL
-- **Adaptive**: Step decay prevents oscillation near optimum
+The PlantAdapter respects RTL timing requirements:
 
-### Why Not Analytical?
+```python
+# 16-cycle settle period after phase change
+if self._detect_phase_change(dac_codes):
+    self._cycles_since_phase_change = 0
+else:
+    self._cycles_since_phase_change += 1
 
-The mapping from target matrix to phases is non-linear and affected by:
-- Manufacturing variations
-- Thermal drift
-- Heater crosstalk
-
-Closed-loop calibration adapts to real conditions; analytical solutions assume ideal hardware.
-
-## Architecture
-
-### Standard Mode
-```
-Input x → [MZI (4 phases)] → Output y = M̂·x
+# Assert adc_valid only after settling
+valid = self._cycles_since_phase_change >= self.settle_cycles
 ```
 
-### SVD Mode
-```
-Input x → [MZI V†] → [VOA Σ] → [MZI U] → Output y = U·Σ·V†·x
-         4 phases   2 gains   4 phases
-```
-
-The SVD architecture can realize **any** matrix with singular values ≤ 1.
-
-## Physical Models
+## Physical Models (Python)
 
 ### MZI Mesh
 - Reck/Clements decomposition structure
@@ -148,8 +256,6 @@ The SVD architecture can realize **any** matrix with singular values ≤ 1.
 
 ### Coherent Receiver
 
-The coherent receiver extracts both the **amplitude** and **phase** of the optical signal using I/Q (In-phase/Quadrature) detection:
-
 ```
                     ┌─────────────┐
 Signal E(t) ───────►│ 90° Hybrid  │──► I = Re{E} = |E|cos(φ)
@@ -158,20 +264,114 @@ LO (reference) ────►│             │──► Q = Im{E} = |E|sin(φ
                     └─────────────┘
 ```
 
-- **I (In-phase)**: The real component of the complex field. Measures projection onto the reference.
-- **Q (Quadrature)**: The imaginary component. Measures projection 90° out of phase.
-- **Together**: I + jQ = E recovers the full complex field, including sign information.
-
-This is essential because:
-- Direct detection (photodiode) only measures |E|², losing phase
-- With I/Q, we can distinguish +0.5 from -0.5 (same power, opposite sign)
-- Matrix calibration needs signed values to achieve negative weights
-
-Hardware:
 - Dual I/Q detection (both output ports)
-- Transimpedance gain: 1000
+- Transimpedance gain: 2047 (fills ADC range)
 - Gaussian noise model
 - 12-bit ADC quantization
+
+## Signal Scaling
+
+### ADC Interface Contract
+
+The coherent receiver outputs are quantized by 12-bit ADCs. The interface contract:
+
+> **Full-scale ADC (±2047 LSB) = ±1.0 optical field amplitude**
+
+This is achieved by setting receiver TIA gain = 2047, matching typical coherent optical system design where the analog front-end fills the ADC dynamic range.
+
+### Fixed-Point Formats
+
+| Signal | Format | Range | Resolution |
+|--------|--------|-------|------------|
+| ADC output | 12-bit signed | ±2047 | 1 LSB |
+| Weights/Inputs | Q1.15 | ±1.0 | 3.05×10⁻⁵ |
+| Phase DAC | 16-bit unsigned | [0, 2π) | 96 µrad |
+| Error metric | 32-bit unsigned | [0, 4.3×10⁹] | 1 |
+
+### ADC to Q1.15 Conversion
+
+The `adc_scaler` module converts accumulated ADC samples to Q1.15:
+
+1. Accumulate 8 ADC samples (adds ~3 bits of precision)
+2. Scale by 2 (left shift 1) to reach Q1.15 range
+
+**Math:** `q15_out = (Σ adc_samples) << 1`
+
+For 1.0 optical: 8 × 2047 = 16376 → 16376 << 1 = 32752 ≈ 32767 (Q1.15 for 1.0)
+
+## Calibration
+
+### Error Metric
+
+The calibration FSM minimizes sum-of-squared error between measured and target matrix elements:
+
+```
+error = Σᵢ (measured[i] - target[i])²
+```
+
+Both measured and target are Q1.15, so error is in squared-LSB units.
+
+### Accuracy Targets
+
+| Accuracy | Per-element diff | Threshold |
+|----------|-----------------|-----------|
+| 1% RMS | 328 LSB | 430,000 |
+| 0.5% RMS | 164 LSB | 100,000 |
+| 0.1% RMS | 33 LSB | 4,000 |
+
+Default threshold (100,000) targets **0.5% RMS error**.
+
+### Convergence
+
+The coordinate descent algorithm adjusts one phase at a time:
+
+1. Probe φ ± Δφ, measure error
+2. Move in direction that reduces error
+3. If no improvement, reduce step size
+4. Repeat until error < threshold for N consecutive iterations
+
+Typical convergence: 500-1500 iterations (~50-150 µs at 100 MHz).
+
+## Calibration Algorithm Details
+
+### Momentum-Based Coordinate Descent
+
+The RTL implements gradient-free optimization with momentum acceleration:
+
+1. **Probing**: For each phase, try φ+Δ and φ−Δ
+2. **Direction**: Move toward lower error
+3. **Momentum**: `v_new = β·v_old + step` where β ≈ 0.3125
+4. **Direction reversal**: Reset velocity when gradient flips (prevents overshoot)
+
+```systemverilog
+// Momentum decay: v >> 2 + v >> 4 ≈ 0.3125 × v
+v_decayed = (velocity >>> 2) + (velocity >>> 4);
+
+// If direction changed, reset velocity
+if (gradient_positive != velocity_positive)
+    v_new = ±step;  // Reset
+else
+    v_new = v_decayed ± step;  // Accumulate
+```
+
+### Hysteresis Lock Detection
+
+Two thresholds prevent oscillation near the lock boundary:
+
+| Threshold | Value | Purpose |
+|-----------|-------|---------|
+| CAL_LOCK_THRESHOLD | 1,048,576 (~1.6% RMS) | Lock when error drops below |
+| CAL_UNLOCK_THRESHOLD | 1,572,864 (~2.4% RMS) | Only reset if error exceeds |
+
+**Hysteresis band**: If error is between thresholds, lock_counter is maintained (not reset). This prevents the calibration from "bouncing" around the threshold.
+
+### Step Size Adaptation
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| PHASE_STEP_INITIAL | 0x1600 (~8.6% of 2π) | Coarse search |
+| PHASE_STEP_MIN | 0x0028 (~0.06% of 2π) | Fine convergence |
+| Decay | ÷2 every 64 iterations | Automatic refinement |
 
 ### Variable Optical Attenuators (SVD mode)
 - 16-bit DAC control
@@ -182,7 +382,7 @@ Hardware:
 
 ```
 CoherentControlMatMul/
-├── run.py                     # Main entry point
+├── run.py                     # Main entry point (runs co-simulation)
 ├── plant/                     # Photonic hardware models
 │   ├── mzi_mesh.py           # MZI transfer matrix
 │   ├── thermal_dynamics.py   # Heater RC model + drift
@@ -190,134 +390,18 @@ CoherentControlMatMul/
 │   ├── voa.py                # Variable attenuators
 │   ├── svd_plant.py          # SVD architecture wrapper
 │   └── plant_wrapper.py      # Unified interface
-├── demo/                      # Control algorithms
-│   ├── control_loop.py       # Standard (unitary) controller
-│   ├── svd_control_loop.py   # SVD controller
-│   ├── visualizer.py         # Plotting utilities
-│   └── run_demo.py           # Demo with visualizations
-├── rtl/                       # SystemVerilog (for cocotb)
+├── rtl/                       # RTL + co-simulation tests
+│   ├── pkg_types.sv          # Type definitions, FSM states
+│   ├── coherent_matmul_top.sv # Calibration controller
+│   ├── Makefile              # cocotb build rules
+│   └── tests/                # Co-simulation tests
+│       ├── plant_adapter.py  # RTL ↔ Python bridge
+│       ├── test_cosim.py     # cocotb test cases
+│       └── conftest.py       # pytest fixtures
 └── sim/results/               # Experiment outputs
 ```
 
-## Example Output
-
-```
-╔══════════════════════════════════════════════════════════╗
-║     Coherent Photonic Matrix Multiply - Run Script       ║
-╚══════════════════════════════════════════════════════════╝
-
-Target Matrix:
-  [[0.7000, -0.3000],
-   [0.2000, -0.5000]]
-
-Using SVD architecture (M = U·Σ·V†)
-
-SVD Decomposition:
-  Singular values: σ = [0.8713, 0.3328]
-
-Calibrating photonic system...
-  ✓ LOCKED in 5 iterations (error: 1.04e-05)
-
-Computing y = M·x for input vectors:
-────────────────────────────────────────────────────────────
-  Input x          Photonic y       Reference y      Error
-────────────────────────────────────────────────────────────
-  [1.00, 0.50]     [0.55, -0.05]    [0.55, -0.05]    7.9e-04
-────────────────────────────────────────────────────────────
-
-Summary:
-  Max absolute error: 7.5e-04
-  RMS error: 5.6e-04
-```
-
-## Design Decisions
-
-| Decision | Choice | Why |
-|----------|--------|-----|
-| Matrix size | 2×2 | Simplest case; scales via Clements/Reck |
-| Weights | Real, any value | SVD + auto-scaling handles arbitrary matrices |
-| Architecture | MZI + optional SVD | Unitary fast, SVD universal |
-| Calibration | Coordinate descent | Noise-robust, hardware-friendly |
-| Detection | Coherent I/Q | Preserves phase, enables signed values |
-| Thermal model | Full RC + drift | Realistic control challenges |
-| Large matrices | Auto-scale + software multiply | Photonic attenuation only; gain in software |
-
-### Why Coherent Detection?
-
-Direct detection (photodiode) measures power |E|², losing phase information. Coherent detection preserves the complex field, enabling:
-- Signed matrix elements (positive and negative)
-- Full complex matrix recovery
-- Linear relationship between field and output
-
-### Why Output-Driven Control?
-
-**Alternative**: Pre-compute phase setpoints from target matrix.
-
-**Problem**: Real hardware has:
-- Manufacturing variations
-- Temperature drift
-- Aging effects
-- Crosstalk
-
-Output-driven control adapts to these automatically. No per-device calibration tables needed.
-
-## Realizability
-
-### Standard Mode (Unitary Only)
-
-A matrix M is realizable if M†M = I (unitary). Check:
-```python
-np.allclose(M @ M.T, np.eye(2))  # Should be True
-```
-
-Examples:
-- ✓ Identity, Swap, Hadamard, rotations
-- ✗ [[0.5, 0], [0, 0.3]] (not unitary)
-
-### SVD Mode (Universal with Auto-Scaling)
-
-SVD mode can realize **any** 2×2 real matrix through automatic scaling:
-
-```python
-# Any matrix works - auto-scaling handles large values
-python run.py --svd --weights 2.0 -1.5 3.0 -2.5 --input 1.0 0.5
-```
-
-**How it works:**
-1. Compute SVD: M = U·Σ·V†
-2. If max(σ) > 1.0, normalize: M_norm = M / max(σ)
-3. Calibrate photonic system to realize M_norm
-4. Scale outputs in software: y = max(σ) × y_photonic
-
-**Example with auto-scaling:**
-```
-Target Matrix:
-  [[2.0000, -1.5000],
-   [3.0000, -2.5000]]
-
-SVD Decomposition:
-  Singular values: σ = [4.6356, 0.1079]
-
-  ╔═══════════════════════════════════════════════════════╗
-  ║  AUTO-SCALING APPLIED                                 ║
-  ╠═══════════════════════════════════════════════════════╣
-  ║  Original σ_max = 4.6356 > 1.0                        ║
-  ║  Matrix normalized by factor: 4.6356                  ║
-  ║  Photonic outputs will be scaled by 4.6356×           ║
-  ╚═══════════════════════════════════════════════════════╝
-
-Computing y = M·x for input vectors:
-  (Photonic outputs scaled by 4.6356× to match original matrix)
-```
-
-This approach:
-- Works for any real matrix (no restrictions on weight values)
-- Preserves full precision of the photonic system
-- Applies scaling in software (simple multiply)
-
 ## RTL Implementation
-
-The `rtl/` directory contains SystemVerilog implementing the calibration controller for both unitary and SVD modes.
 
 ### Software/Hardware Boundary
 
@@ -325,6 +409,7 @@ The `rtl/` directory contains SystemVerilog implementing the calibration control
 |-----------|-------------------|----------------|
 | SVD decomposition | ✓ `np.linalg.svd(M)` | - |
 | σ → DAC conversion | ✓ `voa.sigma_to_dac()` | - |
+| Photonic simulation | ✓ MZI, thermal, noise | - |
 | Calibration FSM | - | ✓ coordinate descent |
 | I/Q measurement | - | ✓ ADC sampling |
 | Phase DAC output | - | ✓ 10 DAC channels |
@@ -375,11 +460,81 @@ Index:   0   1   2   3   4   5   6   7   8   9
          └── V† mesh ──┘  └VOA┘  └── U mesh ──┘
 ```
 
-### Why This Split?
+## Design Decisions
 
-- **SVD in software**: Matrix decomposition requires floating-point; doing it off-chip keeps RTL simple
-- **Calibration in hardware**: Real-time feedback loop needs low latency; RTL handles coordinate descent
-- **σ passed as DAC codes**: Avoids floating-point in RTL; software pre-computes the mapping
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Matrix size | 2×2 | Simplest case; scales via Clements/Reck |
+| Verification | RTL + Python co-sim | Realistic closed-loop testing |
+| Calibration | Coordinate descent in RTL | Noise-robust, hardware-friendly |
+| Plant model | Python | Easy to modify, realistic physics |
+| Detection | Coherent I/Q | Preserves phase, enables signed values |
+| Thermal model | Full RC + drift | Realistic control challenges |
+
+## Writing Custom Tests
+
+```python
+import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import RisingEdge, ClockCycles
+
+from tests.plant_adapter import PlantAdapter
+from plant.plant_wrapper import PhotonicPlant, float_to_q1_15
+
+@cocotb.test()
+async def test_my_matrix(dut):
+    """Test calibration to custom matrix."""
+    cocotb.start_soon(Clock(dut.clk, 10, units='ns').start())
+
+    plant = PhotonicPlant(noise_std=2.0, seed=42)
+    adapter = PlantAdapter(dut, plant)
+
+    # Reset
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    # Set target weights
+    dut.w0.value = float_to_q1_15(0.8)
+    dut.w1.value = float_to_q1_15(0.6)
+    dut.w2.value = float_to_q1_15(-0.6)
+    dut.w3.value = float_to_q1_15(0.8)
+
+    # Start adapter and calibration
+    cocotb.start_soon(adapter.run())
+    dut.start_cal.value = 1
+    await RisingEdge(dut.clk)
+    dut.start_cal.value = 0
+
+    # Wait for lock
+    for _ in range(50000):
+        await RisingEdge(dut.clk)
+        if dut.cal_locked.value:
+            break
+
+    adapter.stop()
+    assert dut.cal_locked.value, "Calibration failed"
+```
+
+## Glossary
+
+| Term | Definition |
+|------|------------|
+| **DAC code** | 16-bit value (0–65535) controlling phase shifter voltage |
+| **Q1.15** | Fixed-point format: 1 sign bit, 15 fractional bits, range [−1, 1) |
+| **MZI** | Mach-Zehnder Interferometer—optical 2×2 coupler with phase control |
+| **I/Q** | In-phase/Quadrature—complex signal decomposition |
+| **RMS error** | Root-mean-square error as percentage of full scale |
+| **Lock** | Calibration complete—error below threshold for N cycles |
+| **Hysteresis** | Different lock/unlock thresholds to prevent oscillation |
+| **Momentum** | Velocity accumulation in optimizer to accelerate convergence |
+| **Unitary** | Matrix where M†M = I (preserves signal power) |
+| **SVD** | Singular Value Decomposition: M = U·Σ·V† |
+| **VOA** | Variable Optical Attenuator—controls signal amplitude |
+| **Basis input** | Test vectors [1,0] and [0,1] to measure matrix columns |
+| **Settling time** | 16 cycles after phase change for thermal equilibrium |
+| **Coordinate descent** | Optimization that adjusts one parameter at a time |
+| **Coherent receiver** | Optical detector that measures both amplitude and phase via I/Q |
 
 ## License
 

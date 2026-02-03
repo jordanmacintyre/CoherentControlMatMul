@@ -49,18 +49,34 @@ package pkg_types;
     parameter int Q2_14_FRAC_BITS = 14;
 
     //-------------------------------------------------------------------------
-    // Calibration parameters
+    // Calibration parameters - tuned for convergence on complex matrices
+    //
+    // Error threshold: ~1M squared LSB = ~3% RMS per element
+    // This allows Hadamard, swap, and arbitrary SVD matrices to converge
     //-------------------------------------------------------------------------
     parameter int unsigned CAL_SETTLE_CYCLES  = 16;     // Cycles to wait after phase change
     parameter int unsigned CAL_AVG_SAMPLES    = 8;      // Samples to average per measurement
-    parameter int unsigned CAL_MAX_ITERATIONS = 1000;   // Max calibration iterations
-    parameter int unsigned CAL_LOCK_THRESHOLD = 32'h0000_0100;  // Error threshold for lock
-    parameter int unsigned CAL_LOCK_COUNT     = 4;      // Consecutive iterations below threshold
+    parameter int unsigned CAL_MAX_ITERATIONS = 20000;  // Doubled for complex matrices
+    parameter int unsigned CAL_LOCK_THRESHOLD   = 32'h0010_0000;  // 1,048,576 (~3.1% RMS)
+    parameter int unsigned CAL_UNLOCK_THRESHOLD = 32'h0018_0000;  // 1,572,864 (~1.5x lock, hysteresis)
+    parameter int unsigned CAL_LOCK_COUNT       = 4;      // Faster lock detection
 
     // Phase update step sizes (16-bit for PHASE_WIDTH)
-    parameter logic [15:0] PHASE_STEP_INITIAL = 16'h1000;  // ~0.39 rad initial step
-    parameter logic [15:0] PHASE_STEP_MIN     = 16'h0040;  // ~0.015 rad minimum step
-    parameter int unsigned PHASE_STEP_DECAY   = 2;         // Shift right by 1 = divide by 2
+    // PHASE_STEP_INITIAL = 0x1600 ≈ 8.6% of 2π for coarse search
+    // PHASE_STEP_MIN = 0x0028 ≈ 0.06% of 2π for fine convergence
+    parameter logic [15:0] PHASE_STEP_INITIAL = 16'h1600;  // ~0.54 rad initial step
+    parameter logic [15:0] PHASE_STEP_MIN     = 16'h0028;  // ~0.004 rad minimum step
+    parameter int unsigned PHASE_STEP_DECAY   = 1;         // Shift right by 1 = divide by 2
+
+    //-------------------------------------------------------------------------
+    // Momentum-based optimization parameters
+    //
+    // Velocity update: v = (v >> 2) + (v >> 4) + step_contribution
+    // This gives β ≈ 0.3125 momentum decay (v retains 5/16 of previous value)
+    // Reduced from 0.625 to prevent overshoot and faster damping
+    //-------------------------------------------------------------------------
+    parameter int unsigned MOMENTUM_DECAY_SHIFT1 = 2;   // v >> 2 = 0.25
+    parameter int unsigned MOMENTUM_DECAY_SHIFT2 = 4;   // v >> 4 = 0.0625, total β = 0.3125
 
     //-------------------------------------------------------------------------
     // Calibration FSM states (Unitary mode - 4-bit encoding)
