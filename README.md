@@ -21,8 +21,7 @@ The key insight is that **users specify what they want (matrix weights), not how
 # Install dependencies
 pip install -e .
 pip install cocotb
-brew install icarus-verilog  # macOS
-# or: apt install iverilog   # Linux
+brew install verilator  # macOS
 
 # Check dependencies
 python run.py --check-deps
